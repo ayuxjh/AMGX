@@ -214,6 +214,46 @@ void compute_block_inverse_row_major4x4_formula( volatile ValueType *s_Amat, con
     //Einv[e_offset] = cofactor/epsilon(det) ;
 }
 
+template<typename IndexType, typename ValueType>
+__device__
+void compute_block_inverse_row_major_5_8( volatile ValueType *s_Amat, const int s_offset, const int e_offset, const int i_ind, const int j_ind, ValueType *Einv, const int bsize, int lane_id_div_Sq, int I )
+{
+//ROW MAJOR
+    ValueType diag;
+    ValueType tmp;
+    // unsigned int active_mask = utils::activemask();
+
+    for (int row = 0; row < bsize; row++)
+    {
+        diag = isNotCloseToZero( s_A_rval(row, row) ) ? types::util<ValueType>::get_one() / s_A_rval(row, row) : types::util<ValueType>::get_one() / epsilon(s_A_rval(row, row));
+
+        if ((i_ind == 0) && !(j_ind == row) && (lane_id_div_Sq < I) )
+        {
+            tmp = s_A_rval(row, j_ind) * diag;
+            s_A_lval(tmp, row, j_ind);
+        }
+        __syncthreads();
+
+        if ((i_ind != row) && !(j_ind == row) && (lane_id_div_Sq < I))
+        {
+            tmp = types::util<ValueType>::invert(s_A_rval(i_ind, row) * s_A_rval(row, j_ind)) + s_A_rval(i_ind, j_ind);
+            s_A_lval(tmp, i_ind, j_ind);
+        }
+        __syncthreads();
+
+        if ((i_ind == 0) && (lane_id_div_Sq < I))
+        {
+            tmp = (j_ind == row) ? diag : types::util<ValueType>::invert(s_A_rval(j_ind, row) * diag);
+            s_A_lval(tmp, j_ind, row);
+        }
+        __syncthreads();
+    }
+
+    if(lane_id_div_Sq < I)
+        Einv[e_offset] = s_A_rval(i_ind, j_ind);
+}
+
+
 template<typename IndexType, typename ValueType, int bsize, bool store_result>
 __device__
 void compute_block_inverse_row_major4x4_formula2( volatile ValueType *s_Amat, const int s_offset, const int e_offset, const int i_ind, const int j_ind, ValueType *Einv )
@@ -242,6 +282,112 @@ void compute_block_inverse_row_major4x4_formula2( volatile ValueType *s_Amat, co
     s_A(i_ind, j_ind) = my_A * cofactor;
     // Each thread computes det
     ValueType det = s_A(0, 0) + s_A(0, 1) + s_A(0, 2) + s_A(0, 3);
+
+    if (store_result)
+    {
+        if (isNotCloseToZero(det) )
+        {
+            Einv[e_offset] = cofactor / det;
+        }
+        else
+        {
+            Einv[e_offset] = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
+        }
+
+        //Einv[e_offset] = cofactor/epsilon(det);
+    }
+    else
+    {
+        if (isNotCloseToZero(det) )
+        {
+            s_A(i_ind, j_ind) = cofactor / det;
+        }
+        else
+            //s_A(i_ind,j_ind) = cofactor/epsilon(det);
+        {
+            s_A(i_ind, j_ind) = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
+        }
+    }
+}
+template<typename IndexType, typename ValueType, int bsize, bool store_result>
+__device__
+void compute_block_inverse_row_major2x2_formula2( volatile ValueType *s_Amat, const int s_offset, const int e_offset, const int i_ind, const int j_ind, ValueType *Einv )
+{
+    short I0, I1;
+    short J0, J1;
+    I0 = !j_ind;
+    I1 = 1 + (j_ind < 2);
+    J0 = !i_ind;
+    J1 = 1 + (i_ind < 2);
+    // Each thread computes its co-factors
+    ValueType cofactor = 0.;
+    
+    // cofactor += s_A(I0, J0) * s_A(I1, J1) * (s_A(I1, J1) + 1.0 - s_A(I1, J1));    
+    // cofactor -= s_A(I0, J1) * s_A(I1, J0) * (s_A(I1, J0) + 1.0 - s_A(I1, J0));
+    // cofactor += s_A(I0, J0) * s_A(I1, J1);    
+    // cofactor -= s_A(I0, J1) * s_A(I1, J0);
+    cofactor += s_A(I0, J0) ;
+
+    if ((i_ind + j_ind) % 2) { cofactor *= -1; }
+
+    ValueType my_A = s_A(j_ind, i_ind);
+    // Each thread stores its result in shared memory to compute determinant
+    s_A(i_ind, j_ind) = my_A * cofactor;
+    // Each thread computes det
+    ValueType det = s_A(0, 0) + s_A(0, 1);
+
+    if (store_result)
+    {
+        if (isNotCloseToZero(det) )
+        {
+            Einv[e_offset] = cofactor / det;
+        }
+        else
+        {
+            Einv[e_offset] = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
+        }
+
+        //Einv[e_offset] = cofactor/epsilon(det);
+    }
+    else
+    {
+        if (isNotCloseToZero(det) )
+        {
+            s_A(i_ind, j_ind) = cofactor / det;
+        }
+        else
+            //s_A(i_ind,j_ind) = cofactor/epsilon(det);
+        {
+            s_A(i_ind, j_ind) = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
+        }
+    }
+}
+
+template<typename IndexType, typename ValueType, int bsize, bool store_result>
+__device__
+void compute_block_inverse_row_major3x3_formula2( volatile ValueType *s_Amat, const int s_offset, const int e_offset, const int i_ind, const int j_ind, ValueType *Einv )
+{
+    short I0, I1;
+    short J0, J1;
+    I0 = !j_ind;
+    I1 = 1 + (j_ind < 2);
+    J0 = !i_ind;
+    J1 = 1 + (i_ind < 2);
+    // Each thread computes its co-factors
+    ValueType cofactor = 0.;
+    
+    // cofactor += s_A(I0, J0) * s_A(I1, J1) * (s_A(I1, J1) + 1.0 - s_A(I1, J1));    
+    // cofactor -= s_A(I0, J1) * s_A(I1, J0) * (s_A(I1, J0) + 1.0 - s_A(I1, J0));
+    cofactor += s_A(I0, J0) * s_A(I1, J1);    
+    cofactor -= s_A(I0, J1) * s_A(I1, J0);
+
+    if ((i_ind + j_ind) % 2) { cofactor *= -1; }
+
+    ValueType my_A = s_A(j_ind, i_ind);
+    // Each thread stores its result in shared memory to compute determinant
+    s_A(i_ind, j_ind) = my_A * cofactor;
+    // Each thread computes det
+    ValueType det = s_A(0, 0) + s_A(0, 1) + s_A(0, 2);
 
     if (store_result)
     {

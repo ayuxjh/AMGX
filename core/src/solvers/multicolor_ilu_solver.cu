@@ -465,6 +465,302 @@ void LU_forward_4x4_kernel(const IndexType *LU_row_offsets, const IndexType *LU_
 }
 #endif
 
+#ifdef EXPERIMENTAL_LU_FORWARD
+
+template<typename IndexType, typename ValueTypeA, typename ValueTypeB, int CtaSize, int bsize, bool ROW_MAJOR, bool hasDiag>
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 16 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void LU_forward_3x3_kernel_warp( const IndexType *LU_row_offsets,
+                                 const IndexType *LU_smaller_color_offsets,
+                                 const IndexType *LU_column_indices,
+                                 const ValueTypeA *LU_nonzero_values,
+                                 const IndexType *A_row_offsets,
+                                 const IndexType *A_column_indices,
+                                 const ValueTypeA *A_nonzero_values,
+                                 const IndexType *A_dia_indices,
+                                 const ValueTypeB *x,
+                                 const ValueTypeB *b,
+                                 ValueTypeB *delta,
+                                 const int *sorted_rows_by_color,
+                                 const int num_rows_per_color,
+                                 const int current_color,
+                                 bool xIsZero )
+{
+    const int nHalfWarps = CtaSize / 16; // Number of half warps per Cta
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    const int halfWarpId = threadIdx.x / 16;
+    const int halfLaneId = threadIdx.x % 16;
+    const int halfLaneId_div_4 = halfLaneId / 4;
+    const int halfLaneId_mod_4 = halfLaneId % 4;
+#if __CUDA_ARCH__ < 300
+    // Shared memory to broadcast column IDs.
+    __shared__ volatile int s_aColIds[CtaSize];
+    // Each thread keeps its own pointer.
+    volatile int *my_s_aColIds = &s_aColIds[16 * halfWarpId];
+#else
+    const int upperHalf = 16 * (laneId / 16);
+#endif
+    // Shared memory needed to exchange X and delta.
+    __shared__ volatile ValueTypeB s_mem[CtaSize];
+    // Each thread keeps its own pointer to shared memory to avoid some extra computations.
+    volatile ValueTypeB *my_s_mem = &s_mem[16 * halfWarpId];
+
+    // Iterate over the rows of the matrix. One warp per row.
+    for ( int aRowIt = blockIdx.x * nHalfWarps + halfWarpId ; aRowIt < num_rows_per_color ; aRowIt += gridDim.x * nHalfWarps )
+    {
+        int aRowId = sorted_rows_by_color[aRowIt];
+        // Load one block of B.
+        ValueTypeB my_bmAx(0);
+
+        unsigned int active_mask = utils::activemask();
+
+        if ( ROW_MAJOR )
+        {
+            if ( halfLaneId_mod_4 == 0 && halfLaneId_div_4 != 3 )
+            {
+                my_bmAx = __cachingLoad(&b[3 * aRowId + halfLaneId_div_4]);
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     my_bmAx = __cachingLoad(&b[3 * aRowId + halfLaneId_mod_4]);
+            // }
+        }
+
+        // Don't do anything if X is zero.
+        if ( !xIsZero )
+        {
+            int aColBegin = A_row_offsets[aRowId  ];
+            int aColEnd   = A_row_offsets[aRowId + 1];
+            int aColMax = aColEnd;
+
+            if ( hasDiag )
+            {
+                ++aColMax;
+            }
+
+            // Each warp load column indices of 32 nonzero blocks
+            for ( ; utils::any( aColBegin < aColMax, active_mask ) ; aColBegin += 16 )
+            {
+                int aColIt = aColBegin + halfLaneId;
+                // Get the ID of the column.
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = A_column_indices[aColIt];
+                }
+
+                if ( hasDiag && aColIt == aColEnd )
+                {
+                    aColId = aRowId;
+                }
+
+#if __CUDA_ARCH__ < 300
+                my_s_aColIds[halfLaneId] = aColId;
+#endif
+                // Count the number of active columns.
+                int vote =  utils::ballot(aColId != -1, active_mask);
+                // The number of iterations.
+                int nCols = max( __popc( vote & 0x0000ffff ), __popc( vote & 0xffff0000 ) );
+
+                // Loop over columns. We compute 8 columns per iteration.
+                for ( int k = 0 ; k < nCols ; k += 4 )
+                {
+                    int my_k = k + halfLaneId_div_4;
+                    // Load 8 blocks of X.
+#if __CUDA_ARCH__ < 300
+                    int waColId = my_s_aColIds[my_k];
+#else
+                    int waColId = utils::shfl( aColId, upperHalf + my_k, warpSize, active_mask );
+#endif
+                    ValueTypeB my_x(0);
+
+                    if ( waColId != -1  &&  halfLaneId_mod_4 != 3 )
+                    {
+                        my_x = __cachingLoad(&x[3 * waColId + halfLaneId_mod_4]);
+                    }
+
+                    my_s_mem[halfLaneId] = my_x;
+                    utils::syncwarp();
+                    // Load 8 blocks of A.
+#pragma unroll
+                    for ( int i = 0 ; i < 4 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        if ( hasDiag && w_aColTmp == aColEnd )
+                        {
+                            w_aColIt = A_dia_indices[aRowId];
+                        }
+
+                        ValueTypeA my_val(0);
+
+                        if ( w_aColIt != -1 )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                                my_val = A_nonzero_values[9 * w_aColIt + 3 * halfLaneId_div_4 + halfLaneId_mod_4];
+                        }
+
+                        if ( ROW_MAJOR )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                                my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_mod_4];
+                        }
+                        else
+                        {
+                            //FatalError("Haven't implemented LU_forward_3x3 for not COL_MAJOR", AMGX_ERR_NOT_SUPPORTED_TARGET);
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+        } // if xIsZero
+
+        // Contribution from each nonzero column that has color less than yours
+        if ( current_color != 0 )
+        {
+            // TODO: Use constant or texture here
+            int aColBegin = LU_row_offsets[aRowId];
+            int aColEnd   = LU_smaller_color_offsets[aRowId];
+
+            // Each warp load column indices of 32 nonzero blocks
+            for ( ; utils::any( aColBegin < aColEnd, active_mask ) ; aColBegin += 16 )
+            {
+                int aColIt = aColBegin + halfLaneId;
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = LU_column_indices[aColIt];
+                }
+
+#if __CUDA_ARCH__ < 300
+                my_s_aColIds[halfLaneId] = aColId;
+#endif
+
+                // Count the number of active columns.
+                int vote =  utils::ballot(aColId != -1, active_mask);
+                // The number of iterations.
+                int nCols = max( __popc( vote & 0x0000ffff ), __popc( vote & 0xffff0000 ) );
+
+                for ( int k = 0 ; k < nCols ; k += 4 )
+                {
+                    int my_k = k + halfLaneId_div_4;
+                    // Load 8 blocks of X.
+#if __CUDA_ARCH__ < 300
+                    int waColId = my_s_aColIds[my_k];
+#else
+                    int waColId = utils::shfl( aColId, upperHalf + my_k, warpSize, active_mask );
+#endif
+                    ValueTypeB my_delta(0);
+
+                    if ( waColId != -1 )
+                    {
+                        if(halfLaneId_mod_4 != 3 )
+                            my_delta = delta[3 * waColId + halfLaneId_mod_4];
+                    }
+
+                    my_s_mem[halfLaneId] = my_delta;
+                    utils::syncwarp(); // making sure smem write propagated
+                    // Update b-Ax.
+#pragma unroll
+                    for ( int i = 0 ; i < 4 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        ValueTypeA my_val(0);
+
+                        if ( w_aColIt != -1 )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                            my_val = LU_nonzero_values[9 * w_aColIt + 3 * halfLaneId_div_4 + halfLaneId_mod_4];
+                        }
+
+                        if ( ROW_MAJOR )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                                my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_mod_4];
+                                //my_bmAx -= my_val;
+                            // else
+                            //     my_bmAx = 0.0;
+                        }
+                        else
+                        {
+                            //FatalError("Haven't implemented LU_forward_3x3 for not COL_MAJOR", AMGX_ERR_NOT_SUPPORTED_TARGET);
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+        } // If current_color != 0
+
+        // Reduce bmAx terms.
+#if __CUDA_ARCH__ >= 300
+
+        if ( ROW_MAJOR )
+        {
+            my_bmAx += utils::shfl_xor( my_bmAx, 1, warpSize, active_mask );
+            my_bmAx += utils::shfl_xor( my_bmAx, 2, warpSize, active_mask );
+        }
+        else
+        {
+            my_bmAx += utils::shfl_xor( my_bmAx, 4, warpSize, active_mask );
+            my_bmAx += utils::shfl_xor( my_bmAx, 8, warpSize, active_mask );
+        }
+
+#else
+        s_mem[threadIdx.x] = my_bmAx;
+
+        if ( ROW_MAJOR )
+        {
+            if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+
+            if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 2]; }
+        }
+        else
+        {
+            if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+            if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+        }
+
+#endif
+
+        // Store the results.
+        if ( ROW_MAJOR )
+        {
+            if ( (halfLaneId_mod_4 == 0) && (halfLaneId_div_4 != 3) )
+            {
+                delta[3 * aRowId + halfLaneId_div_4] = my_bmAx;
+            }
+        }
+        else
+        {
+                //FatalError("Haven't implemented LU_forward_3x3 for not COL_MAJOR", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+    }
+}
+#else
+    FatalError("Haven't implemented LU_forward_3x3 for not EXPERIMENTAL_LU", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
+
 #ifdef EXPERIMENTAL_LU_BACKWARD
 
 template< typename IndexType, typename ValueTypeA, typename ValueTypeB, int CtaSize, bool ROW_MAJOR >
@@ -880,6 +1176,313 @@ void LU_backward_4x4_kernel(const IndexType *row_offsets, const IndexType *large
 }
 
 #endif
+
+#ifdef EXPERIMENTAL_LU_BACKWARD
+
+template< typename IndexType, typename ValueTypeA, typename ValueTypeB, int CtaSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 16 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void LU_backward_3x3_kernel_warp( const IndexType *row_offsets,
+                                  const IndexType *larger_color_offsets,
+                                  const IndexType *column_indices,
+                                  const IndexType *dia_indices,
+                                  const ValueTypeA *nonzero_values,
+                                  const ValueTypeB *delta,
+                                  ValueTypeB *Delta,
+                                  ValueTypeB *x,
+                                  const int *sorted_rows_by_color,
+                                  const int num_rows_per_color,
+                                  const int current_color,
+                                  const int num_colors,
+                                  const ValueTypeB weight,
+                                  bool xIsZero )
+{
+    const int nHalfWarps = CtaSize / 16; // Number of half warps per CTA.
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    const int halfWarpId = threadIdx.x / 16;
+    const int halfLaneId = threadIdx.x % 16;
+    const int halfLaneId_div_4 = halfLaneId / 4;
+    const int halfLaneId_mod_4 = halfLaneId % 4;
+
+#if __CUDA_ARCH__ < 300
+    // Shared memory to broadcast column IDs.
+    __shared__ volatile int s_aColIds[CtaSize];
+    // Each thread keeps its own pointer.
+    volatile int *my_s_aColIds = &s_aColIds[16 * halfWarpId];
+#else
+    const int upperHalf = 16 * (laneId / 16);
+#endif
+    // Shared memory needed to exchange X and delta.
+    __shared__ volatile ValueTypeB s_mem[CtaSize];
+    // Each thread keeps its own pointer to shared memory to avoid some extra computations.
+    volatile ValueTypeB *my_s_mem = &s_mem[16 * halfWarpId];
+
+    // Iterate over the rows of the matrix. One warp per two rows.
+    for ( int aRowIt = blockIdx.x * nHalfWarps + halfWarpId ; aRowIt < num_rows_per_color ; aRowIt += gridDim.x * nHalfWarps )
+    {
+        int aRowId = sorted_rows_by_color[aRowIt];
+        unsigned int active_mask = utils::activemask();
+        // Load one block of B.
+        ValueTypeB my_bmAx(0);
+
+        if ( ROW_MAJOR )
+        {
+            if ( (halfLaneId_mod_4 == 0) && (halfLaneId_div_4 != 3) )
+            {
+                my_bmAx = delta[3 * aRowId + halfLaneId_div_4];
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     my_bmAx = delta[4 * aRowId + halfLaneId_mod_4];
+            // }
+        }
+
+        //Don't do anything if the color is not the interesting one.
+        if ( current_color != num_colors - 1 )
+        {
+            // The range of the rows.
+            int aColBegin = larger_color_offsets[aRowId], aColEnd = row_offsets[aRowId + 1];
+
+            // Each warp load column indices of 16 nonzero blocks
+            for ( ; utils::any( aColBegin < aColEnd, active_mask ) ; aColBegin += 16 )
+            {
+                int aColIt = aColBegin + halfLaneId;
+                // Get the ID of the column.
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = column_indices[aColIt];
+                }
+
+#if __CUDA_ARCH__ < 300
+                my_s_aColIds[halfLaneId] = aColId;
+#endif
+
+                // Loop over columns. We compute 8 columns per iteration.
+                for ( int k = 0 ; k < 16 ; k += 4 )
+                {
+                    int my_k = k + halfLaneId_div_4;
+                    // Exchange column indices.
+#if __CUDA_ARCH__ < 300
+                    int waColId = my_s_aColIds[my_k];
+#else
+                    int waColId = utils::shfl( aColId, upperHalf + my_k, warpSize, active_mask );
+#endif
+                    // Load 8 blocks of X if needed.
+                    ValueTypeB *my_ptr = Delta;
+
+                    if ( xIsZero )
+                    {
+                        my_ptr = x;
+                    }
+
+                    ValueTypeB my_x(0);
+
+                    //if ( waColId != -1  && halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                    if ( waColId != -1  && halfLaneId_mod_4 != 3 )
+                    {
+                        my_x = my_ptr[3 * waColId + halfLaneId_mod_4];
+                    }
+                    
+                    my_s_mem[halfLaneId] = my_x;
+                    utils::syncwarp();
+                    // Load 8 blocks of A.
+#pragma unroll
+                    for ( int i = 0 ; i < 4 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        ValueTypeA my_val(0);
+
+                        if ( w_aColIt != -1 )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3 )
+                            my_val = nonzero_values[9 * w_aColIt + 3 * halfLaneId_div_4 + halfLaneId_mod_4];
+                        }
+
+                        if ( ROW_MAJOR )
+                        {
+                            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3  )
+                                my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_mod_4];
+                        }
+                        else
+                        {
+                            // my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_div_4];
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+
+            // Reduce bmAx terms.
+#if __CUDA_ARCH__ >= 300
+
+            if ( ROW_MAJOR )
+            {
+                my_bmAx += utils::shfl_xor( my_bmAx, 1, warpSize, active_mask );
+                my_bmAx += utils::shfl_xor( my_bmAx, 2, warpSize, active_mask );
+            }
+            else
+            {
+                my_bmAx += utils::shfl_xor( my_bmAx, 4, warpSize, active_mask );
+                my_bmAx += utils::shfl_xor( my_bmAx, 8, warpSize, active_mask );
+            }
+
+#else
+            s_mem[threadIdx.x] = my_bmAx;
+
+            if ( ROW_MAJOR )
+            {
+                if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+
+                if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 2]; }
+            }
+            else
+            {
+                if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+                if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+            }
+
+#endif
+        } // if current_color != num_colors-1
+
+        // Update the shared terms.
+        if ( ROW_MAJOR )
+        {
+            if ( (halfLaneId_mod_4 == 0) && (halfLaneId_div_4 != 3) )
+            {
+                my_s_mem[halfLaneId_div_4] = my_bmAx;
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     my_s_mem[halfLaneId_mod_4] = my_bmAx;
+            // }
+        }
+
+        // Update the diagonal term.
+        int w_aColIt = dia_indices[aRowId];
+        ValueTypeA my_val(0);
+        utils::syncwarp();
+
+        if ( w_aColIt != -1 )
+        {
+            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3)
+                my_val = nonzero_values[9 * w_aColIt + 3 * halfLaneId_div_4 + halfLaneId_mod_4];
+        }
+
+        if ( ROW_MAJOR )
+        {
+            if( halfLaneId_mod_4 != 3 && halfLaneId_div_4 != 3){
+                my_bmAx = my_val * my_s_mem[halfLaneId_mod_4];
+            }
+            else{
+                my_bmAx = 0.0;
+            }
+        }
+        else
+        {
+            // my_bmAx = my_val * my_s_mem[halfLaneId_div_4];
+        }
+
+        // Regroup results.
+#if __CUDA_ARCH__ >= 300
+
+        if ( ROW_MAJOR )
+        {
+            my_bmAx += utils::shfl_xor( my_bmAx, 1 );
+            my_bmAx += utils::shfl_xor( my_bmAx, 2 );
+        }
+        else
+        {
+            my_bmAx += utils::shfl_xor( my_bmAx, 4 );
+            my_bmAx += utils::shfl_xor( my_bmAx, 8 );
+        }
+
+#else
+        s_mem[threadIdx.x] = my_bmAx;
+
+        if ( ROW_MAJOR )
+        {
+            if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+
+            if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 2]; }
+        }
+        else
+        {
+            if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+            if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+        }
+
+#endif
+
+        // Store the results.
+        if ( ROW_MAJOR )
+        {
+            ValueTypeB my_x(0);
+
+            if ( !xIsZero && halfLaneId_mod_4 == 0 && halfLaneId_div_4 != 3 )
+            {
+                my_x = x[3 * aRowId + halfLaneId_div_4];
+            }
+
+            my_x += weight * my_bmAx;
+
+            if ( !xIsZero && halfLaneId_mod_4 == 0 && halfLaneId_div_4 != 3 )
+            {
+                Delta[3 * aRowId + halfLaneId_div_4] = my_bmAx;
+            }
+            
+            if ( halfLaneId_mod_4 == 0 && halfLaneId_div_4 != 3)
+            {
+                x[3 * aRowId + halfLaneId_div_4] = my_x;
+            }
+        }
+        else
+        {
+            // ValueTypeB my_x(0);
+
+            // if ( !xIsZero && halfLaneId_div_4 == 0 )
+            // {
+            //     my_x = x[4 * aRowId + halfLaneId_mod_4];
+            // }
+
+            // my_x += weight * my_bmAx;
+
+            // if ( !xIsZero && halfLaneId_div_4 == 0 )
+            // {
+            //     Delta[4 * aRowId + halfLaneId_mod_4] = my_bmAx;
+            // }
+
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     x[4 * aRowId + halfLaneId_mod_4] = my_x;
+            // }
+        }
+    }
+}
+
+#else
+    FatalError("Haven't implemented LU_backward_3x3 for not EXPERIMENTAL_LU", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
 
 // Assumptions:
 // CtaSize must be multiple of 32
@@ -1555,6 +2158,1421 @@ computeLUFactors_4x4_kernel( int A_nRows,
     } // if RowId < A_nRows;
 }
 #endif
+#ifdef EXPERIMENTAL_LU_FACTORS
+
+
+
+#ifdef EXPERIMENTAL_LU_FACTORS
+
+template< typename ValueTypeA, int CtaSize, int SMemSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void
+compute_LU_factors_1x1_kernel_warp( int A_nRows,
+                                    const int *__restrict A_row_offsets,
+                                    const int *__restrict A_col_indices,
+                                    const int *__restrict A_dia_indices,
+                                    ValueTypeA *__restrict A_nonzero_values,
+                                    const int *__restrict A_smaller_color_offsets,
+                                    const int *__restrict A_larger_color_offsets,
+                                    const int *sorted_rows_by_color,
+                                    const int num_rows_per_color,
+                                    const int current_color,
+                                    int *wk_returnValue )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    // Lane ID in the 3 9-wide segments.
+    const int lane_id_div_1 = laneId / 1;
+    const int lane_id_mod_1 = laneId % 1;
+    // Coordinates inside a 3x3 block of the matrix.
+    const int idx_i = lane_id_mod_1 / 1;
+    const int idx_j = lane_id_mod_1 % 1;
+    int globalWarpId = blockIdx.x * nWarps + warpId;
+    // Shared memory to store the blocks to process
+    __shared__ volatile ValueTypeA s_C_mtx[nWarps][32];
+    __shared__ volatile ValueTypeA s_F_mtx[nWarps][16];
+    // Shared memory to store the proposed column to load
+#if __CUDA_ARCH__ < 300
+    __shared__ volatile int s_aColItToLoad [nWarps][32];
+    __shared__ volatile int s_waColItToLoad[nWarps][32];
+#else
+    __shared__ volatile int s_aColSrc[nWarps][32];
+#endif
+    // Shared memory to store the column indices of the current row
+    __shared__ volatile int s_keys[nWarps][SMemSize];
+
+    while (globalWarpId < num_rows_per_color)
+    {
+        int storedRowId[2];
+        int I = 0;
+
+        for (; I < 2 && globalWarpId < num_rows_per_color ; I++)
+        {
+            int aRowId = sorted_rows_by_color[globalWarpId];
+            storedRowId[I] = aRowId;
+            int aColBeg = A_row_offsets[aRowId + 0];
+            int aColEnd = A_row_offsets[aRowId + 1];
+            int aColSmaller = A_smaller_color_offsets[aRowId];
+            // The number of columns.
+            const int nCols = aColEnd - aColBeg;
+
+            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
+            if ( nCols > SMemSize )
+            {
+                wk_returnValue[0] = 1;
+                return;
+            }
+
+            // Fill-in the local table.
+            const int NUM_STEPS = SMemSize / 32;
+
+#pragma unroll
+            for ( int step = 0, k = laneId ; step < NUM_STEPS ; ++step, k += 32 )
+            {
+                int aColIt = aColBeg + k;
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = A_col_indices[aColIt];
+                }
+
+                s_keys[warpId][k] = aColId;
+            }
+
+            // Now load all column indices of neighbours that have colors smaller than yours
+            for ( int aColIt = aColBeg; aColIt < aColSmaller && lane_id_div_1 < 2; aColIt++)
+            {
+                unsigned int active_mask = utils::activemask();
+                // Read the row to process, should be a broadcast
+                int waRowId = s_keys[warpId][aColIt - aColBeg];
+                // Compute multiplicative factor, load C_jj in first half, C_ij in second half
+                int aColIdx = aColIt;
+
+
+                if ( lane_id_div_1 == 0 )
+                {
+                    aColIdx = A_dia_indices[waRowId];
+                }
+
+
+                s_C_mtx[warpId][laneId] = A_nonzero_values[1 * aColIdx + lane_id_mod_1];
+
+                // Threads 0-8 perform the matrix product
+                ValueTypeA tmp(0);
+
+
+                if (ROW_MAJOR)
+                {
+
+#pragma unroll
+                    for ( int m = 0 ; m < 1 ; ++m )
+                    {
+                        tmp += s_C_mtx[warpId][1 + 1 * idx_i + m] * s_C_mtx[warpId][1 * m + idx_j];
+                    }
+                }
+                else
+                {
+
+// #pragma unroll
+//                         for ( int m = 0 ; m < 3 ; ++m )
+//                         {
+//                             tmp += s_C_mtx[warpId][9 + 3 * m + idx_j] * s_C_mtx[warpId][3 * idx_i + m];
+//                         }
+                }
+
+
+            utils::syncwarp(active_mask);
+
+                if ( lane_id_div_1 == 0 )
+                {
+                    s_F_mtx[warpId][laneId] = tmp;
+                    A_nonzero_values[1 * aColIt + laneId] = tmp;
+                }
+
+                int waColIt  = ld_cg(A_larger_color_offsets + waRowId);
+                int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
+
+                // Load the first 32 columns of waRowId
+                for (waColIt += laneId ; utils::any(waColIt < waColEnd, active_mask ); waColIt += 2 )
+                {
+                    // Each thread loads its column id
+                    int waColId = -1;
+
+                    if ( waColIt < waColEnd )
+                    {
+                        waColId = A_col_indices[waColIt];
+                    }
+
+                    // Find the right column.
+                    int found_aColIt = -1;
+
+#pragma unroll 4
+                    for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
+                        if ( s_keys[warpId][i] == waColId )
+                        {
+                            found_aColIt = i;
+                        }
+
+                    if ( found_aColIt != -1 )
+                    {
+                        found_aColIt += aColBeg;
+                    }
+
+                    // Store all the columns that have been found
+                    const int pred = found_aColIt != -1;
+                    int vote = utils::ballot( pred, active_mask );
+                    const int idst = __popc(vote & utils::lane_mask_lt());
+
+                    if (pred)
+                    {
+#if __CUDA_ARCH__ < 300
+                        s_aColItToLoad [warpId][idst] = found_aColIt;
+                        s_waColItToLoad[warpId][idst] = waColIt;
+#else
+                        s_aColSrc[warpId][idst] = laneId;
+#endif
+                    }
+                    utils::syncwarp(active_mask);
+
+                    const int n_cols = __popc( vote );
+
+                    // Process all columns that have been found
+                    for ( int k = 0 ; k < n_cols ; k += 2 )
+                    {
+                        const int my_k = k + lane_id_div_1;
+                        // Where to get columns from.
+                        int a_col_it = -1, w_col_it = -1;
+                        // Load column to load
+#if __CUDA_ARCH__ < 300
+                        if ( my_k < n_cols )
+                        {
+                            a_col_it = s_aColItToLoad [warpId][my_k];
+                            w_col_it = s_waColItToLoad[warpId][my_k];
+                        }
+#else
+                        a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+
+                        if ( my_k >= n_cols )
+                        {
+                            a_col_it = -1;
+                            w_col_it = -1;
+                        }
+
+#endif
+                        ValueTypeA my_C(0);
+
+                        if (( w_col_it != -1 ) && ( lane_id_div_1 < 2 ))
+                        {
+                            my_C = A_nonzero_values[1 * w_col_it + lane_id_mod_1];
+                        }
+
+                        if ( lane_id_div_1 < 2 )
+                             s_C_mtx[warpId][laneId] = my_C;
+                        // Run the matrix-matrix product.
+                        ValueTypeA tmp(0);
+                        utils::syncwarp( active_mask );
+
+                        if (ROW_MAJOR)
+                        {
+#pragma unroll
+                            for ( int m = 0 ; m < 1 ; ++m )
+                            {
+                                tmp += s_F_mtx[warpId][1 * idx_i + m] * s_C_mtx[warpId][1 * lane_id_div_1 + 1 * m + idx_j];
+                            }
+                        }
+                        else
+                        {
+// #pragma unroll
+//                             for ( int m = 0 ; m < 3 ; ++m )
+//                             {
+//                                 tmp += s_F_mtx[warpId][3 * m + idx_j] * s_C_mtx[warpId][9 * lane_id_div_1 + 3 * idx_i + m];
+//                             }
+                        }
+
+                        if ( a_col_it != -1 )
+                        {
+                            A_nonzero_values[1 * a_col_it + lane_id_mod_1] -= tmp;
+                        }
+                    } // Loop over columns that have a match (for k=0;k<n_cols)
+                } // Loop over the columns of waRowId
+
+                //}  // Loop j=0;j<32
+            } // Loop over the columns of aRowId
+
+            globalWarpId += nWarps * gridDim.x;
+        } // end of loop over I
+
+
+        // Now compute the inverse of the block C_jj
+        if ( lane_id_div_1 == 0 || I == 2 )
+        {
+            const int offset = 1 * A_dia_indices[storedRowId[lane_id_div_1]] + lane_id_mod_1;
+            s_C_mtx[warpId][laneId] = A_nonzero_values[offset];
+            utils::syncwarp(utils::activemask());
+            double a =  s_C_mtx[warpId][laneId];
+            if ( isNotCloseToZero(a))
+                a = 1.0 / a;
+            else 
+                a = 1.0 / epsilon(a);
+            
+            A_nonzero_values[offset] = a;
+            // if (ROW_MAJOR)
+            // {
+            //     compute_block_inverse_row_major2x2_formula2<int, ValueTypeA, 3, true>( s_C_mtx[warpId], 9 * lane_id_div_1, offset, idx_i, idx_j, A_nonzero_values );
+            //     s_C_mtx[warpId][laneId] = a;
+            // }
+            // else
+            // {
+            //     //#TODO compute_block_inverse_row_major3x3_formula2
+            // }
+        } // End of if statement
+    } // End of while loop
+}
+
+#else
+    FatalError("Haven't implemented compute_LU_factors_3x3 for Not EXPERIMENTAL_LU_FACTORS", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
+#ifdef EXPERIMENTAL_LU_FACTORS
+
+template< typename ValueTypeA, int CtaSize, int SMemSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void
+compute_LU_factors_2x2_kernel_warp( int A_nRows,
+                                    const int *__restrict A_row_offsets,
+                                    const int *__restrict A_col_indices,
+                                    const int *__restrict A_dia_indices,
+                                    ValueTypeA *__restrict A_nonzero_values,
+                                    const int *__restrict A_smaller_color_offsets,
+                                    const int *__restrict A_larger_color_offsets,
+                                    const int *sorted_rows_by_color,
+                                    const int num_rows_per_color,
+                                    const int current_color,
+                                    int *wk_returnValue )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    // Lane ID in the 3 9-wide segments.
+    const int lane_id_div_4 = laneId / 4;
+    const int lane_id_mod_4 = laneId % 4;
+    // Coordinates inside a 3x3 block of the matrix.
+    const int idx_i = lane_id_mod_4 / 2;
+    const int idx_j = lane_id_mod_4 % 2;
+    int globalWarpId = blockIdx.x * nWarps + warpId;
+    // Shared memory to store the blocks to process
+    __shared__ volatile ValueTypeA s_C_mtx[nWarps][32];
+    __shared__ volatile ValueTypeA s_F_mtx[nWarps][16];
+    // Shared memory to store the proposed column to load
+#if __CUDA_ARCH__ < 300
+    __shared__ volatile int s_aColItToLoad [nWarps][32];
+    __shared__ volatile int s_waColItToLoad[nWarps][32];
+#else
+    __shared__ volatile int s_aColSrc[nWarps][32];
+#endif
+    // Shared memory to store the column indices of the current row
+    __shared__ volatile int s_keys[nWarps][SMemSize];
+
+    while (globalWarpId < num_rows_per_color)
+    {
+        int storedRowId[2];
+        int I = 0;
+
+        for (; I < 2 && globalWarpId < num_rows_per_color ; I++)
+        {
+            int aRowId = sorted_rows_by_color[globalWarpId];
+            storedRowId[I] = aRowId;
+            int aColBeg = A_row_offsets[aRowId + 0];
+            int aColEnd = A_row_offsets[aRowId + 1];
+            int aColSmaller = A_smaller_color_offsets[aRowId];
+            // The number of columns.
+            const int nCols = aColEnd - aColBeg;
+
+            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
+            if ( nCols > SMemSize )
+            {
+                wk_returnValue[0] = 1;
+                return;
+            }
+
+            // Fill-in the local table.
+            const int NUM_STEPS = SMemSize / 32;
+
+#pragma unroll
+            for ( int step = 0, k = laneId ; step < NUM_STEPS ; ++step, k += 32 )
+            {
+                int aColIt = aColBeg + k;
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = A_col_indices[aColIt];
+                }
+
+                s_keys[warpId][k] = aColId;
+            }
+
+            // Now load all column indices of neighbours that have colors smaller than yours
+            for ( int aColIt = aColBeg; aColIt < aColSmaller && lane_id_div_4 < 2; aColIt++)
+            {
+                unsigned int active_mask = utils::activemask();
+                // Read the row to process, should be a broadcast
+                int waRowId = s_keys[warpId][aColIt - aColBeg];
+                // Compute multiplicative factor, load C_jj in first half, C_ij in second half
+                int aColIdx = aColIt;
+
+
+                if ( lane_id_div_4 == 0 )
+                {
+                    aColIdx = A_dia_indices[waRowId];
+                }
+
+
+                s_C_mtx[warpId][laneId] = A_nonzero_values[4 * aColIdx + lane_id_mod_4];
+
+                // Threads 0-8 perform the matrix product
+                ValueTypeA tmp(0);
+
+
+                if (ROW_MAJOR)
+                {
+
+#pragma unroll
+                    for ( int m = 0 ; m < 2 ; ++m )
+                    {
+                        tmp += s_C_mtx[warpId][4 + 2 * idx_i + m] * s_C_mtx[warpId][2 * m + idx_j];
+                    }
+                }
+                else
+                {
+
+// #pragma unroll
+//                         for ( int m = 0 ; m < 3 ; ++m )
+//                         {
+//                             tmp += s_C_mtx[warpId][9 + 3 * m + idx_j] * s_C_mtx[warpId][3 * idx_i + m];
+//                         }
+                }
+
+
+            utils::syncwarp(active_mask);
+
+                if ( lane_id_div_4 == 0 )
+                {
+                    s_F_mtx[warpId][laneId] = tmp;
+                    A_nonzero_values[4 * aColIt + laneId] = tmp;
+                }
+
+                int waColIt  = ld_cg(A_larger_color_offsets + waRowId);
+                int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
+
+                // Load the first 32 columns of waRowId
+                for (waColIt += laneId ; utils::any(waColIt < waColEnd, active_mask ); waColIt += 8 )
+                {
+                    // Each thread loads its column id
+                    int waColId = -1;
+
+                    if ( waColIt < waColEnd )
+                    {
+                        waColId = A_col_indices[waColIt];
+                    }
+
+                    // Find the right column.
+                    int found_aColIt = -1;
+
+#pragma unroll 4
+                    for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
+                        if ( s_keys[warpId][i] == waColId )
+                        {
+                            found_aColIt = i;
+                        }
+
+                    if ( found_aColIt != -1 )
+                    {
+                        found_aColIt += aColBeg;
+                    }
+
+                    // Store all the columns that have been found
+                    const int pred = found_aColIt != -1;
+                    int vote = utils::ballot( pred, active_mask );
+                    const int idst = __popc(vote & utils::lane_mask_lt());
+
+                    if (pred)
+                    {
+#if __CUDA_ARCH__ < 300
+                        s_aColItToLoad [warpId][idst] = found_aColIt;
+                        s_waColItToLoad[warpId][idst] = waColIt;
+#else
+                        s_aColSrc[warpId][idst] = laneId;
+#endif
+                    }
+                    utils::syncwarp(active_mask);
+
+                    const int n_cols = __popc( vote );
+
+                    // Process all columns that have been found
+                    for ( int k = 0 ; k < n_cols ; k += 2 )
+                    {
+                        const int my_k = k + lane_id_div_4;
+                        // Where to get columns from.
+                        int a_col_it = -1, w_col_it = -1;
+                        // Load column to load
+#if __CUDA_ARCH__ < 300
+                        if ( my_k < n_cols )
+                        {
+                            a_col_it = s_aColItToLoad [warpId][my_k];
+                            w_col_it = s_waColItToLoad[warpId][my_k];
+                        }
+#else
+                        a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+
+                        if ( my_k >= n_cols )
+                        {
+                            a_col_it = -1;
+                            w_col_it = -1;
+                        }
+
+#endif
+                        ValueTypeA my_C(0);
+
+                        if (( w_col_it != -1 ) && ( lane_id_div_4 < 2 ))
+                        {
+                            my_C = A_nonzero_values[4 * w_col_it + lane_id_mod_4];
+                        }
+
+                        if ( lane_id_div_4 < 2 )
+                             s_C_mtx[warpId][laneId] = my_C;
+                        // Run the matrix-matrix product.
+                        ValueTypeA tmp(0);
+                        utils::syncwarp( active_mask );
+
+                        if (ROW_MAJOR)
+                        {
+#pragma unroll
+                            for ( int m = 0 ; m < 2 ; ++m )
+                            {
+                                tmp += s_F_mtx[warpId][2 * idx_i + m] * s_C_mtx[warpId][4 * lane_id_div_4 + 2 * m + idx_j];
+                            }
+                        }
+                        else
+                        {
+// #pragma unroll
+//                             for ( int m = 0 ; m < 3 ; ++m )
+//                             {
+//                                 tmp += s_F_mtx[warpId][3 * m + idx_j] * s_C_mtx[warpId][9 * lane_id_div_4 + 3 * idx_i + m];
+//                             }
+                        }
+
+                        if ( a_col_it != -1 )
+                        {
+                            A_nonzero_values[4 * a_col_it + lane_id_mod_4] -= tmp;
+                        }
+                    } // Loop over columns that have a match (for k=0;k<n_cols)
+                } // Loop over the columns of waRowId
+
+                //}  // Loop j=0;j<32
+            } // Loop over the columns of aRowId
+
+            globalWarpId += nWarps * gridDim.x;
+        } // end of loop over I
+
+
+        // Now compute the inverse of the block C_jj
+        if ( lane_id_div_4 == 0 || I == 2 )
+        {
+            const int offset = 4 * A_dia_indices[storedRowId[lane_id_div_4]] + lane_id_mod_4;
+            s_C_mtx[warpId][laneId] = A_nonzero_values[offset];
+            utils::syncwarp(utils::activemask());
+
+            if (ROW_MAJOR)
+            {
+                compute_block_inverse_row_major2x2_formula2<int, ValueTypeA, 2, true>( s_C_mtx[warpId], 4 * lane_id_div_4, offset, idx_i, idx_j, A_nonzero_values );
+            }
+            else
+            {
+                //#TODO compute_block_inverse_row_major3x3_formula2
+            }
+        } // End of if statement
+    } // End of while loop
+}
+
+#else
+    FatalError("Haven't implemented compute_LU_factors_3x3 for Not EXPERIMENTAL_LU_FACTORS", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif  
+
+template< typename ValueTypeA, int CtaSize, int SMemSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void
+compute_LU_factors_3x3_kernel_warp( int A_nRows,
+                                    const int *__restrict A_row_offsets,
+                                    const int *__restrict A_col_indices,
+                                    const int *__restrict A_dia_indices,
+                                    ValueTypeA *__restrict A_nonzero_values,
+                                    const int *__restrict A_smaller_color_offsets,
+                                    const int *__restrict A_larger_color_offsets,
+                                    const int *sorted_rows_by_color,
+                                    const int num_rows_per_color,
+                                    const int current_color,
+                                    int *wk_returnValue )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    // Lane ID in the 3 9-wide segments.
+    const int lane_id_div_9 = laneId / 9;
+    const int lane_id_mod_9 = laneId % 9;
+    // Coordinates inside a 3x3 block of the matrix.
+    const int idx_i = lane_id_mod_9 / 3;
+    const int idx_j = lane_id_mod_9 % 3;
+    int globalWarpId = blockIdx.x * nWarps + warpId;
+    // Shared memory to store the blocks to process
+    __shared__ volatile ValueTypeA s_C_mtx[nWarps][32];
+    __shared__ volatile ValueTypeA s_F_mtx[nWarps][16];
+    // Shared memory to store the proposed column to load
+#if __CUDA_ARCH__ < 300
+    __shared__ volatile int s_aColItToLoad [nWarps][32];
+    __shared__ volatile int s_waColItToLoad[nWarps][32];
+#else
+    __shared__ volatile int s_aColSrc[nWarps][32];
+#endif
+    // Shared memory to store the column indices of the current row
+    __shared__ volatile int s_keys[nWarps][SMemSize];
+
+    while (globalWarpId < num_rows_per_color)
+    {
+        int storedRowId[2];
+        int I = 0;
+
+        for (; I < 2 && globalWarpId < num_rows_per_color ; I++)
+        {
+            int aRowId = sorted_rows_by_color[globalWarpId];
+            storedRowId[I] = aRowId;
+            int aColBeg = A_row_offsets[aRowId + 0];
+            int aColEnd = A_row_offsets[aRowId + 1];
+            int aColSmaller = A_smaller_color_offsets[aRowId];
+            // The number of columns.
+            const int nCols = aColEnd - aColBeg;
+
+            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
+            if ( nCols > SMemSize )
+            {
+                wk_returnValue[0] = 1;
+                return;
+            }
+
+            // Fill-in the local table.
+            const int NUM_STEPS = SMemSize / 32;
+
+#pragma unroll
+            for ( int step = 0, k = laneId ; step < NUM_STEPS ; ++step, k += 32 )
+            {
+                int aColIt = aColBeg + k;
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = A_col_indices[aColIt];                    
+                }
+
+                s_keys[warpId][k] = aColId;
+            }
+
+            // Now load all column indices of neighbours that have colors smaller than yours
+            for ( int aColIt = aColBeg; aColIt < aColSmaller && lane_id_div_9 < 2; aColIt++)
+            {
+                unsigned int active_mask = utils::activemask();
+                // Read the row to process, should be a broadcast
+                int waRowId = s_keys[warpId][aColIt - aColBeg];
+                // Compute multiplicative factor, load C_jj in first half, C_ij in second half
+                int aColIdx = aColIt;
+                
+
+                if ( lane_id_div_9 == 0 )
+                {
+                    aColIdx = A_dia_indices[waRowId];
+                }
+
+
+                s_C_mtx[warpId][laneId] = A_nonzero_values[9 * aColIdx + lane_id_mod_9];
+
+                // Threads 0-8 perform the matrix product
+                ValueTypeA tmp(0);
+                
+
+                if (ROW_MAJOR)
+                {
+
+#pragma unroll
+                    for ( int m = 0 ; m < 3 ; ++m )
+                    {
+                        tmp += s_C_mtx[warpId][9 + 3 * idx_i + m] * s_C_mtx[warpId][3 * m + idx_j];
+                    }
+                }
+                else
+                {
+
+// #pragma unroll
+//                         for ( int m = 0 ; m < 3 ; ++m )
+//                         {
+//                             tmp += s_C_mtx[warpId][9 + 3 * m + idx_j] * s_C_mtx[warpId][3 * idx_i + m];
+//                         }
+                }
+
+
+            utils::syncwarp(active_mask);
+
+                if ( lane_id_div_9 == 0 )
+                {
+                    s_F_mtx[warpId][laneId] = tmp;
+                    A_nonzero_values[9 * aColIt + laneId] = tmp;
+                }
+
+                int waColIt  = ld_cg(A_larger_color_offsets + waRowId);
+                int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
+
+                // Load the first 32 columns of waRowId
+                for (waColIt += laneId ; utils::any(waColIt < waColEnd, active_mask ); waColIt += 18 )
+                {
+                    // Each thread loads its column id
+                    int waColId = -1;
+
+                    if ( waColIt < waColEnd )
+                    {
+                        waColId = A_col_indices[waColIt];
+                    }
+
+                    // Find the right column.
+                    int found_aColIt = -1;
+
+#pragma unroll 4
+                    for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
+                        if ( s_keys[warpId][i] == waColId )
+                        {
+                            found_aColIt = i;
+                        }
+
+                    if ( found_aColIt != -1 )
+                    {
+                        found_aColIt += aColBeg;
+                    }
+
+                    // Store all the columns that have been found
+                    const int pred = found_aColIt != -1;
+                    int vote = utils::ballot( pred, active_mask );
+                    const int idst = __popc(vote & utils::lane_mask_lt());
+
+                    if (pred)
+                    {
+#if __CUDA_ARCH__ < 300
+                        s_aColItToLoad [warpId][idst] = found_aColIt;
+                        s_waColItToLoad[warpId][idst] = waColIt;
+#else
+                        s_aColSrc[warpId][idst] = laneId;
+#endif
+                    }
+                    utils::syncwarp(active_mask);
+
+                    const int n_cols = __popc( vote );
+
+                    // Process all columns that have been found
+                    for ( int k = 0 ; k < n_cols ; k += 2 )
+                    {
+                        const int my_k = k + lane_id_div_9;
+                        // Where to get columns from.
+                        int a_col_it = -1, w_col_it = -1;
+                        // Load column to load
+#if __CUDA_ARCH__ < 300
+                        if ( my_k < n_cols )
+                        {
+                            a_col_it = s_aColItToLoad [warpId][my_k];
+                            w_col_it = s_waColItToLoad[warpId][my_k];
+                        }
+#else
+                        a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+
+                        if ( my_k >= n_cols )
+                        {
+                            a_col_it = -1;
+                            w_col_it = -1;
+                        }
+
+#endif
+                        ValueTypeA my_C(0);
+
+                        if (( w_col_it != -1 ) && ( lane_id_div_9 < 2 ))
+                        {
+                            my_C = A_nonzero_values[9 * w_col_it + lane_id_mod_9];
+                        }
+
+                        if ( lane_id_div_9 < 2 )
+                             s_C_mtx[warpId][laneId] = my_C;
+                        // Run the matrix-matrix product.
+                        ValueTypeA tmp(0);
+                        utils::syncwarp( active_mask );
+
+                        if (ROW_MAJOR)
+                        {
+#pragma unroll
+                            for ( int m = 0 ; m < 3 ; ++m )
+                            {
+                                tmp += s_F_mtx[warpId][3 * idx_i + m] * s_C_mtx[warpId][9 * lane_id_div_9 + 3 * m + idx_j];
+                            }
+                        }
+                        else
+                        {
+// #pragma unroll
+//                             for ( int m = 0 ; m < 3 ; ++m )
+//                             {
+//                                 tmp += s_F_mtx[warpId][3 * m + idx_j] * s_C_mtx[warpId][9 * lane_id_div_9 + 3 * idx_i + m];
+//                             }
+                        }
+
+                        if ( a_col_it != -1 )
+                        {
+                            A_nonzero_values[9 * a_col_it + lane_id_mod_9] -= tmp;
+                        }
+                    } // Loop over columns that have a match (for k=0;k<n_cols)
+                } // Loop over the columns of waRowId
+
+                //}  // Loop j=0;j<32
+            } // Loop over the columns of aRowId
+
+            globalWarpId += nWarps * gridDim.x;
+        } // end of loop over I
+
+
+        // Now compute the inverse of the block C_jj
+        if ( lane_id_div_9 == 0 || I == 2 )
+        {
+            const int offset = 9 * A_dia_indices[storedRowId[lane_id_div_9]] + lane_id_mod_9;
+            s_C_mtx[warpId][laneId] = A_nonzero_values[offset];
+            utils::syncwarp(utils::activemask());
+
+            if (ROW_MAJOR)
+            {
+                compute_block_inverse_row_major3x3_formula2<int, ValueTypeA, 3, true>( s_C_mtx[warpId], 9 * lane_id_div_9, offset, idx_i, idx_j, A_nonzero_values );
+            }
+            else
+            {
+                //#TODO compute_block_inverse_row_major3x3_formula2
+            }
+        } // End of if statement
+    } // End of while loop
+}
+
+#else
+    FatalError("Haven't implemented compute_LU_factors_3x3 for Not EXPERIMENTAL_LU_FACTORS", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
+#ifdef EXPERIMENTAL_LU_FACTORS
+
+template< typename ValueTypeA, int CtaSize, int SMemSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void
+compute_LU_factors_5x5_kernel_warp( int A_nRows,
+                                    const int *__restrict A_row_offsets,
+                                    const int *__restrict A_col_indices,
+                                    const int *__restrict A_dia_indices,
+                                    ValueTypeA *__restrict A_nonzero_values,
+                                    const int *__restrict A_smaller_color_offsets,
+                                    const int *__restrict A_larger_color_offsets,
+                                    const int *sorted_rows_by_color,
+                                    const int num_rows_per_color,
+                                    const int current_color,
+                                    const int blockDim,
+                                    int *wk_returnValue )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int Sq = blockDim * blockDim;
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    // Lane ID in the b Sq-wide segments.
+    const int lane_id_div_Sq = threadIdx.x / Sq;
+    const int lane_id_mod_Sq = threadIdx.x % Sq;
+    // Coordinates inside a bxb block of the matrix.
+    const int idx_i = lane_id_mod_Sq / blockDim;
+    const int idx_j = lane_id_mod_Sq % blockDim;
+    int globalBlockId = blockIdx.x;
+    // Shared memory to store the blocks to process
+    __shared__ volatile ValueTypeA s_C_mtx[64];
+    __shared__ volatile ValueTypeA s_F_mtx[32];
+    // Shared memory to store the proposed column to load
+#if __CUDA_ARCH__ < 300
+    // __shared__ volatile int s_aColItToLoad [nWarps][32];
+    // __shared__ volatile int s_waColItToLoad[nWarps][32];
+#else
+    __shared__ volatile int s_aColIt[nWarps][32];
+    __shared__ volatile int s_waColIt[nWarps][32];
+#endif
+    // Shared memory to store the column indices of the current row
+    __shared__ volatile int s_keys[SMemSize];
+    __shared__ volatile int s_numCols[nWarps];
+
+    while (globalBlockId < num_rows_per_color)
+    {
+        int storedRowId[2];
+        int I = 0;
+
+        for (; I < 2 && globalBlockId < num_rows_per_color ; I++)
+        {
+            int aRowId = sorted_rows_by_color[globalBlockId];
+            storedRowId[I] = aRowId;
+            int aColBeg = A_row_offsets[aRowId + 0];
+            int aColEnd = A_row_offsets[aRowId + 1];
+            int aColSmaller = A_smaller_color_offsets[aRowId];
+            // The number of columns.
+            const int nCols = aColEnd - aColBeg;
+
+            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
+            if ( nCols > SMemSize )
+            {
+                wk_returnValue[0] = 1;
+                return;
+            }
+
+            int aColIt = aColBeg + threadIdx.x;
+            int aColId = -1;
+
+            if ( aColIt < aColEnd )
+            {
+                aColId = A_col_indices[aColIt];
+            }
+
+            s_keys[threadIdx.x] = aColId;
+            __syncthreads();
+
+            // Now load all column indices of neighbours that have colors smaller than yours
+            for ( int aColIt = aColBeg; aColIt < aColSmaller; aColIt++)
+            {
+                unsigned int active_mask = utils::activemask();
+                // Read the row to process, should be a broadcast
+                int waRowId = s_keys[aColIt - aColBeg];
+                // Compute multiplicative factor, load C_jj in first half, C_ij in second half
+                int aColIdx = aColIt;
+
+
+                if ( lane_id_div_Sq == 0 )
+                {
+                    aColIdx = A_dia_indices[waRowId];
+                }
+
+                if ( lane_id_div_Sq < 2 )
+                {
+                    s_C_mtx[threadIdx.x] = A_nonzero_values[Sq * aColIdx + lane_id_mod_Sq];
+                }
+
+                __syncthreads();
+                // Threads 0-sq perform the matrix product
+                ValueTypeA tmp(0);
+
+                if (lane_id_div_Sq == 0)
+                {
+                    if (ROW_MAJOR)
+                    {
+
+                        for ( int m = 0 ; m < blockDim ; ++m )
+                        {
+                            tmp += s_C_mtx[Sq + blockDim * idx_i + m] * s_C_mtx[blockDim * m + idx_j];
+                        }
+                    }
+                    else
+                    {
+
+    // #pragma unroll
+    //                         for ( int m = 0 ; m < 3 ; ++m )
+    //                         {
+    //                             tmp += s_C_mtx[warpId][9 + 3 * m + idx_j] * s_C_mtx[warpId][3 * idx_i + m];
+    //                         }
+                    }
+                }
+
+                __syncthreads();
+
+                if ( lane_id_div_Sq == 0 )
+                {
+                    s_F_mtx[threadIdx.x] = tmp;
+                    A_nonzero_values[Sq * aColIt + threadIdx.x] = tmp;
+                }
+                __syncthreads();
+
+                int waColIt  = ld_cg(A_larger_color_offsets + waRowId);
+                int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
+
+                // Load the first 32 columns of waRowId
+                waColIt += threadIdx.x;
+                // Each thread loads its column id
+                int waColId = -1;
+
+                if ( waColIt < waColEnd )
+                {
+                    waColId = A_col_indices[waColIt];
+                }
+
+                // Find the right column.
+                int found_aColIt = -1;
+
+#pragma unroll 4
+                for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
+                    if ( s_keys[i] == waColId )
+                    {
+                        found_aColIt = i;
+                    }
+
+                if ( found_aColIt != -1 )
+                {
+                    found_aColIt += aColBeg;
+                }
+
+                // Store all the columns that have been found
+                const int pred = found_aColIt != -1;
+                int vote = utils::ballot( pred, active_mask );
+                const int idst = __popc(vote & utils::lane_mask_lt());
+
+                if (pred)
+                {
+#if __CUDA_ARCH__ < 300
+                    // s_aColItToLoad [warpId][idst] = found_aColIt;
+                    // s_waColItToLoad[warpId][idst] = waColIt;
+#else
+                    // s_aColSrc[warpId][idst] = threadIdx.x;
+                    s_aColIt [warpId][idst] = found_aColIt;
+                    s_waColIt [warpId][idst] = waColIt;
+#endif
+                }
+                utils::syncwarp(active_mask);
+
+                const int n_cols = __popc( vote );
+                s_numCols[warpId] = 0;
+                if(laneId == 0)
+                    s_numCols[warpId] = n_cols;
+
+                __syncthreads();
+
+                // Process all columns that have been found
+                for ( int j = 0 ; j < nWarps ; j++ )
+                {
+                    int n_cols_warp = s_numCols[j];
+                    for ( int k = 0 ; k < n_cols_warp; k += 2 )
+                    {
+                        const int my_k = k + lane_id_div_Sq;
+                        // Where to get columns from.
+                        int a_col_it = -1, w_col_it = -1;
+                        // Load column to load
+#if __CUDA_ARCH__ < 300
+                        // if ( my_k < n_cols )
+                        // {
+                        //     a_col_it = s_aColItToLoad [warpId][my_k];
+                        //     w_col_it = s_waColItToLoad[warpId][my_k];
+                        // }
+#else
+                        // a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        // w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        if ( my_k < n_cols_warp && lane_id_div_Sq < 2 )
+                        {
+                            a_col_it = s_aColIt [j][my_k];
+                            w_col_it = s_waColIt[j][my_k];
+                        }
+
+#endif
+                        ValueTypeA my_C(0);
+
+                        if ( w_col_it != -1 && lane_id_div_Sq < 2 )
+                        {
+                            my_C = A_nonzero_values[Sq * w_col_it + lane_id_mod_Sq];
+                        }
+
+                        if (lane_id_div_Sq < 2)
+                             s_C_mtx[threadIdx.x] = my_C;
+                        // Run the matrix-matrix product.
+                        ValueTypeA tmp(0);
+                        // utils::syncwarp( active_mask );
+                        __syncthreads();
+
+
+
+                        if ( lane_id_div_Sq < 2 )
+                        {
+                            if (ROW_MAJOR)
+                            {
+                                for ( int m = 0 ; m < blockDim ; ++m )
+                                {
+                                    tmp += s_F_mtx[blockDim * idx_i + m] * s_C_mtx[Sq * lane_id_div_Sq + blockDim * m + idx_j];
+                                }
+                            }
+                            else
+                            {
+// #pragma unroll
+//                             for ( int m = 0 ; m < 3 ; ++m )
+//                             {
+//                                 tmp += s_F_mtx[warpId][3 * m + idx_j] * s_C_mtx[warpId][9 * lane_id_div_9 + 3 * idx_i + m];
+//                             }
+                            }
+
+                            if ( a_col_it != -1 )
+                            {
+                                A_nonzero_values[Sq * a_col_it + lane_id_mod_Sq] -= tmp;
+                            }
+
+                        }
+
+                    } // Loop over columns that have a match (for k=0;k<n_cols)
+
+
+                }
+                // Loop over the columns of waRowId
+
+                //}  // Loop j=0;j<32
+            } // Loop over the columns of aRowId
+
+            globalBlockId += gridDim.x;
+        } // end of loop over I
+
+        // Now compute the inverse of the block C_jj
+         int offset = 0;
+         if ( (lane_id_div_Sq == 0 || I == 2) &&  lane_id_div_Sq < 2 )
+         {
+            offset = Sq * A_dia_indices[storedRowId[lane_id_div_Sq]] + lane_id_mod_Sq;
+            s_C_mtx[threadIdx.x] = A_nonzero_values[offset];
+         } // End of if statement
+         __syncthreads();
+
+
+        if (ROW_MAJOR)
+        {
+            compute_block_inverse_row_major_5_8<int, ValueTypeA>( s_C_mtx, Sq * lane_id_div_Sq, offset, idx_i, idx_j, A_nonzero_values, blockDim, lane_id_div_Sq, I);
+        }
+        else
+        {
+            //#TODO compute_block_inverse_row_major3x3_formula2
+        }
+
+
+    } // End of while loop
+}
+
+#else
+    FatalError("Haven't implemented compute_LU_factors_5x5 for Not EXPERIMENTAL_LU_FACTORS", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
+#ifdef EXPERIMENTAL_LU_FACTORS
+
+template< typename ValueTypeA, int CtaSize, int SMemSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void
+compute_LU_factors_6_8x6_8_kernel_warp( int A_nRows,
+                                    const int *__restrict A_row_offsets,
+                                    const int *__restrict A_col_indices,
+                                    const int *__restrict A_dia_indices,
+                                    ValueTypeA *__restrict A_nonzero_values,
+                                    const int *__restrict A_smaller_color_offsets,
+                                    const int *__restrict A_larger_color_offsets,
+                                    const int *sorted_rows_by_color,
+                                    const int num_rows_per_color,
+                                    const int current_color,
+                                    const int blockDim,
+                                    int *wk_returnValue )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int Sq = blockDim * blockDim;
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    // Lane ID in the b Sq-wide segments.
+    const int lane_id_div_Sq = threadIdx.x / Sq;
+    const int lane_id_mod_Sq = threadIdx.x % Sq;
+    // Coordinates inside a bxb block of the matrix.
+    const int idx_i = lane_id_mod_Sq / blockDim;
+    const int idx_j = lane_id_mod_Sq % blockDim;
+    int globalBlockId = blockIdx.x;
+    // Shared memory to store the blocks to process
+    __shared__ volatile ValueTypeA s_C_mtx[128];
+    __shared__ volatile ValueTypeA s_F_mtx[64];
+    // Shared memory to store the proposed column to load
+#if __CUDA_ARCH__ < 300
+    // __shared__ volatile int s_aColItToLoad [nWarps][32];
+    // __shared__ volatile int s_waColItToLoad[nWarps][32];
+#else
+    __shared__ volatile int s_aColIt[nWarps][32];
+    __shared__ volatile int s_waColIt[nWarps][32];
+#endif
+    // Shared memory to store the column indices of the current row
+    __shared__ volatile int s_keys[SMemSize];
+    __shared__ volatile int s_numCols[nWarps];
+
+    while (globalBlockId < num_rows_per_color)
+    {
+        int storedRowId[2];
+        int I = 0;
+
+        for (; I < 2 && globalBlockId < num_rows_per_color ; I++)
+        {
+            int aRowId = sorted_rows_by_color[globalBlockId];
+            storedRowId[I] = aRowId;
+            int aColBeg = A_row_offsets[aRowId + 0];
+            int aColEnd = A_row_offsets[aRowId + 1];
+            int aColSmaller = A_smaller_color_offsets[aRowId];
+            // The number of columns.
+            const int nCols = aColEnd - aColBeg;
+
+            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
+            if ( nCols > SMemSize )
+            {
+                wk_returnValue[0] = 1;
+                return;
+            }
+
+            int aColIt = aColBeg + threadIdx.x;
+            int aColId = -1;
+
+            if ( aColIt < aColEnd )
+            {
+                aColId = A_col_indices[aColIt];
+            }
+
+            s_keys[threadIdx.x] = aColId;
+            __syncthreads();
+
+            // Now load all column indices of neighbours that have colors smaller than yours
+            for ( int aColIt = aColBeg; aColIt < aColSmaller; aColIt++)
+            {
+                unsigned int active_mask = utils::activemask();
+                // Read the row to process, should be a broadcast
+                int waRowId = s_keys[aColIt - aColBeg];
+                // Compute multiplicative factor, load C_jj in first half, C_ij in second half
+                int aColIdx = aColIt;
+
+
+                if ( lane_id_div_Sq == 0 )
+                {
+                    aColIdx = A_dia_indices[waRowId];
+                }
+
+                if ( lane_id_div_Sq < 2 )
+                {
+                    s_C_mtx[threadIdx.x] = A_nonzero_values[Sq * aColIdx + lane_id_mod_Sq];
+                }
+
+                __syncthreads();
+                // Threads 0-sq perform the matrix product
+                ValueTypeA tmp(0);
+
+                if (lane_id_div_Sq == 0)
+                {
+                    if (ROW_MAJOR)
+                    {
+
+                        for ( int m = 0 ; m < blockDim ; ++m )
+                        {
+                            tmp += s_C_mtx[Sq + blockDim * idx_i + m] * s_C_mtx[blockDim * m + idx_j];
+                        }
+                    }
+                    else
+                    {
+
+    // #pragma unroll
+    //                         for ( int m = 0 ; m < 3 ; ++m )
+    //                         {
+    //                             tmp += s_C_mtx[warpId][9 + 3 * m + idx_j] * s_C_mtx[warpId][3 * idx_i + m];
+    //                         }
+                    }
+                }
+
+                __syncthreads();
+
+                if ( lane_id_div_Sq == 0 )
+                {
+                    s_F_mtx[threadIdx.x] = tmp;
+                    A_nonzero_values[Sq * aColIt + threadIdx.x] = tmp;
+                }
+                __syncthreads();
+
+                int waColIt  = ld_cg(A_larger_color_offsets + waRowId);
+                int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
+
+                // Load the first 32 columns of waRowId
+                waColIt += threadIdx.x;
+                // Each thread loads its column id
+                int waColId = -1;
+
+                if ( waColIt < waColEnd )
+                {
+                    waColId = A_col_indices[waColIt];
+                }
+
+                // Find the right column.
+                int found_aColIt = -1;
+
+#pragma unroll 4
+                for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
+                    if ( s_keys[i] == waColId )
+                    {
+                        found_aColIt = i;
+                    }
+
+                if ( found_aColIt != -1 )
+                {
+                    found_aColIt += aColBeg;
+                }
+
+                // Store all the columns that have been found
+                const int pred = found_aColIt != -1;
+                int vote = utils::ballot( pred, active_mask );
+                const int idst = __popc(vote & utils::lane_mask_lt());
+
+                if (pred)
+                {
+#if __CUDA_ARCH__ < 300
+                    // s_aColItToLoad [warpId][idst] = found_aColIt;
+                    // s_waColItToLoad[warpId][idst] = waColIt;
+#else
+                    // s_aColSrc[warpId][idst] = threadIdx.x;
+                    s_aColIt [warpId][idst] = found_aColIt;
+                    s_waColIt [warpId][idst] = waColIt;
+#endif
+                }
+                utils::syncwarp(active_mask);
+
+                const int n_cols = __popc( vote );
+                s_numCols[warpId] = 0;
+                if(laneId == 0)
+                s_numCols[warpId] = n_cols;
+
+                __syncthreads();
+
+                // Process all columns that have been found
+                for ( int j = 0 ; j < nWarps ; j++ )
+                {
+                    int n_cols_warp = s_numCols[j];
+                    for ( int k = 0 ; k < n_cols_warp; k += 2 )
+                    {
+                        const int my_k = k + lane_id_div_Sq;
+                        // Where to get columns from.
+                        int a_col_it = -1, w_col_it = -1;
+                        // Load column to load
+#if __CUDA_ARCH__ < 300
+                        // if ( my_k < n_cols )
+                        // {
+                        //     a_col_it = s_aColItToLoad [warpId][my_k];
+                        //     w_col_it = s_waColItToLoad[warpId][my_k];
+                        // }
+#else
+                        // a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        // w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        if ( my_k < n_cols_warp && lane_id_div_Sq < 2 )
+                        {
+                            a_col_it = s_aColIt [j][my_k];
+                            w_col_it = s_waColIt[j][my_k];
+                        }
+
+#endif
+                        ValueTypeA my_C(0);
+
+                        if ( w_col_it != -1 && lane_id_div_Sq < 2 )
+                        {
+                            my_C = A_nonzero_values[Sq * w_col_it + lane_id_mod_Sq];
+                        }
+
+                        if (lane_id_div_Sq < 2)
+                             s_C_mtx[threadIdx.x] = my_C;
+                        // Run the matrix-matrix product.
+                        ValueTypeA tmp(0);
+                        // utils::syncwarp( active_mask );
+                        __syncthreads();
+
+
+
+                        if ( lane_id_div_Sq < 2 )
+                        {
+                            if (ROW_MAJOR)
+                            {
+                                for ( int m = 0 ; m < blockDim ; ++m )
+                                {
+                                    tmp += s_F_mtx[blockDim * idx_i + m] * s_C_mtx[Sq * lane_id_div_Sq + blockDim * m + idx_j];
+                                }
+                            }
+                            else
+                            {
+// #pragma unroll
+//                             for ( int m = 0 ; m < 3 ; ++m )
+//                             {
+//                                 tmp += s_F_mtx[warpId][3 * m + idx_j] * s_C_mtx[warpId][9 * lane_id_div_9 + 3 * idx_i + m];
+//                             }
+                            }
+
+                            if ( a_col_it != -1 )
+                            {
+                                A_nonzero_values[Sq * a_col_it + lane_id_mod_Sq] -= tmp;
+                            }
+
+                        }
+
+                    } // Loop over columns that have a match (for k=0;k<n_cols)
+
+
+                }
+                // Loop over the columns of waRowId
+
+                //}  // Loop j=0;j<32
+            } // Loop over the columns of aRowId
+
+            globalBlockId += gridDim.x;
+        } // end of loop over I
+
+        // Now compute the inverse of the block C_jj
+         int offset = 0;
+         if ( (lane_id_div_Sq == 0 || I == 2) &&  lane_id_div_Sq < 2 )
+         {
+            offset = Sq * A_dia_indices[storedRowId[lane_id_div_Sq]] + lane_id_mod_Sq;
+            s_C_mtx[threadIdx.x] = A_nonzero_values[offset];
+         } // End of if statement
+         __syncthreads();
+
+
+        if (ROW_MAJOR)
+        {
+            compute_block_inverse_row_major_5_8<int, ValueTypeA>( s_C_mtx, Sq * lane_id_div_Sq, offset, idx_i, idx_j, A_nonzero_values, blockDim, lane_id_div_Sq, I);
+        }
+        else
+        {
+            //#TODO compute_block_inverse_row_major3x3_formula2
+        }
+
+
+    } // End of while loop
+}
+
+#else
+    FatalError("Haven't implemented compute_LU_factors_6~8x6~8 for Not EXPERIMENTAL_LU_FACTORS", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
 // ----------
 // Methods
 // ----------
@@ -1813,6 +3831,175 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
 
             cudaCheckError();
         }
+               else if( this->m_LU.get_block_dimx() == 1 && this->m_LU.get_block_dimy() == 1 )
+        {
+            if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+            {
+                compute_LU_factors_1x1_kernel_warp<ValueTypeA, CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
+                    this->m_LU.get_num_rows( ),
+                    thrust::raw_pointer_cast( &this->m_LU.row_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.col_indices[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.diag[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.values[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_smaller_color_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_larger_color_offsets[0] ),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    thrust::raw_pointer_cast( &returnValue[0] ) );
+
+                    // if(i == num_colors-1){
+                    //     const char* filename = "LU_3x3";
+                    //     printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
+                    //     PM.print(this->m_LU,filename);
+                    //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                    // }
+
+            }
+            else
+            {
+            FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+            }
+
+            cudaCheckError();
+        }
+        else if( this->m_LU.get_block_dimx() == 2 && this->m_LU.get_block_dimy() == 2 )
+        {
+            if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+            {
+                compute_LU_factors_2x2_kernel_warp<ValueTypeA, CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
+                    this->m_LU.get_num_rows( ),
+                    thrust::raw_pointer_cast( &this->m_LU.row_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.col_indices[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.diag[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.values[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_smaller_color_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_larger_color_offsets[0] ),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    thrust::raw_pointer_cast( &returnValue[0] ) );
+
+                    // if(i == num_colors-1){
+                    //     const char* filename = "LU_3x3";
+                    //     printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
+                    //     PM.print(this->m_LU,filename);
+                    //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                    // }
+
+            }
+            else
+            {
+            FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+            }
+
+            cudaCheckError();
+        }
+        else if( this->m_LU.get_block_dimx() == 3 && this->m_LU.get_block_dimy() == 3 )
+        {
+            if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+            {
+                compute_LU_factors_3x3_kernel_warp<ValueTypeA, CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
+                    this->m_LU.get_num_rows( ),
+                    thrust::raw_pointer_cast( &this->m_LU.row_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.col_indices[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.diag[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.values[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_smaller_color_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_larger_color_offsets[0] ),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    thrust::raw_pointer_cast( &returnValue[0] ) );
+
+                    // if(i == num_colors-1){
+                    //     const char* filename = "LU_3x3";
+                    //     printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
+                    //     PM.print(this->m_LU,filename);
+                    //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                    // }
+            
+            }
+            else
+            {
+            FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+            }
+
+            cudaCheckError();
+        }
+        else if( this->m_LU.get_block_dimx() == 5 && this->m_LU.get_block_dimy() == 5 )
+        {
+            if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+            {
+                compute_LU_factors_5x5_kernel_warp<ValueTypeA, CtaSize/2, SMemSize/2, true> <<< GridSize, CtaSize/2>>>(
+                    this->m_LU.get_num_rows( ),
+                    thrust::raw_pointer_cast( &this->m_LU.row_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.col_indices[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.diag[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.values[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_smaller_color_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_larger_color_offsets[0] ),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    this->m_LU.get_block_dimx(),
+                    thrust::raw_pointer_cast( &returnValue[0] ) );
+
+                    // if(i == num_colors-1){
+                    //     const char* filename = "LU_3x3";
+                    //     printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
+                    //     PM.print(this->m_LU,filename);
+                    //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                    // }
+
+            }
+            else
+            {
+            FatalError("Unsupported 5x5 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+            }
+
+            cudaCheckError();
+        }
+        else if( this->m_LU.get_block_dimx() > 5 && this->m_LU.get_block_dimy() > 5 && this->m_LU.get_block_dimx() <= 8 && this->m_LU.get_block_dimy() <=  8 )
+        {
+            if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+            {
+                int GridSize = std::min( 2048,  num_rows_per_color );
+
+                if ( GridSize == 0 )
+                {
+                    continue;    // if perfect coloring (color 0 has no vertices)
+                }
+
+                compute_LU_factors_6_8x6_8_kernel_warp<ValueTypeA, CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
+                    this->m_LU.get_num_rows( ),
+                    thrust::raw_pointer_cast( &this->m_LU.row_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.col_indices[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.diag[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.values[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_smaller_color_offsets[0] ),
+                    thrust::raw_pointer_cast( &this->m_LU.m_larger_color_offsets[0] ),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    this->m_LU.get_block_dimx(),
+                    thrust::raw_pointer_cast( &returnValue[0] ) );
+
+                    // if(i == 1){
+                    //     const char* filename = "LU_6x6";
+                    //     printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
+                    //     PM.print(this->m_LU,filename);
+                    //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                    // }
+
+            }
+            else
+            {
+            FatalError("Unsupported 6～8x6～8 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+            }
+
+            cudaCheckError();
+        }
         else
         {
             FatalError("Unsupported block size for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
@@ -1982,6 +4169,10 @@ MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, boo
     if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 4 && this->m_LU.get_block_dimy() == 4) )
     {
         smooth_4x4(b, x, xIsZero);
+    }
+    else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 3 && this->m_LU.get_block_dimy() == 3) )
+    {
+        smooth_3x3(b, x, xIsZero);
     }
     else
     {
@@ -2284,6 +4475,164 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_3x3(const VVector &b, VVector &x, bool xIsZero)
+{
+    FatalError("Haven't implemented Multicolor smooth3x3 smoother for host format", AMGX_ERR_NOT_SUPPORTED_TARGET);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_3x3(const VVector &b, VVector &x, bool xIsZero)
+{
+    Matrix<TConfig_d> &m_LU = this->m_LU;
+    Matrix<TConfig_d> &m_A = *this->m_explicit_A;
+    int N = m_LU.get_num_rows() * m_LU.get_block_dimy();
+    cudaCheckError();
+
+    if (!m_LU.getColsReorderedByColor())
+    {
+        FatalError("ILU solver currently only works if columns are reordered by color. Try setting reordering_cols_by_color=1 in the multicolor_ilu solver scope in the configuration file", AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    // ---------------------------------------------------------
+    // Solving Lower triangular system, with identity diagonal
+    // ---------------------------------------------------------
+    const IndexType *LU_sorted_rows_by_color_ptr = m_LU.getMatrixColoring().getSortedRowsByColor().raw();
+    int num_colors = this->m_LU.getMatrixColoring().getNumColors();
+    for (int i = 0; i < num_colors; i++)
+    {
+        const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
+        const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
+#ifdef EXPERIMENTAL_LU_FORWARD
+        const int CtaSize = 128; // Number of threads per CTA
+        const int nHalfWarps = CtaSize / 16;
+        int GridSize = std::min( 2048, ( num_rows_per_color + nHalfWarps - 1 ) / nHalfWarps );
+        
+        if ( GridSize == 0 )
+        {
+            continue;    // if perfect coloring (color 0 has no vertices)
+        }
+
+        if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+        {
+            if (m_A.hasProps(DIAG))
+            {
+               FatalError("Haven't implemented compute LU_forward_3x3 for matrix has diag props", AMGX_ERR_NOT_SUPPORTED_TARGET);
+            }
+            else
+            {
+                    LU_forward_3x3_kernel_warp<IndexType, ValueTypeA, ValueTypeB, CtaSize, 4, true, false> <<< GridSize, CtaSize>>>(
+                    m_LU.row_offsets.raw(),
+                    m_LU.m_smaller_color_offsets.raw(),
+                    m_LU.col_indices.raw(),
+                    m_LU.values.raw(),
+                    m_A.row_offsets.raw(),
+                    m_A.col_indices.raw(),
+                    m_A.values.raw(),
+                    m_A.diag.raw(),
+                    x.raw(),
+                    b.raw(),
+                    this->m_delta.raw(),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    xIsZero );
+           }
+        }
+        else
+        {
+            // COL_MAJOR
+            FatalError("Haven't implemented compute LU_forward_3x3 for Col Major", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+
+#else
+            FatalError("Haven't implemented compute LU_forward_3x3 for Not EXPERIMENTAL_LU_FORWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+
+#endif
+        cudaCheckError();
+    }
+    // --------------------
+    // Backward Sweep
+    // --------------------
+    for (int i = num_colors - 1; i >= 0; i--)
+    {
+        const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
+        const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
+#ifdef EXPERIMENTAL_LU_BACKWARD
+        const int CtaSize = 128; // Number of threads per CTA
+        const int nHalfWarps = CtaSize / 16;
+        int GridSize = std::min( 2048, ( num_rows_per_color + nHalfWarps - 1 ) / nHalfWarps );
+
+        if ( GridSize == 0 )
+        {
+            continue;    // if perfect coloring (color 0 has no vertices)
+        }
+
+        if (this->m_explicit_A->getBlockFormat() == ROW_MAJOR)
+        {
+            LU_backward_3x3_kernel_warp<IndexType, ValueTypeA, ValueTypeB, CtaSize, true> <<< GridSize, CtaSize>>>(
+                m_LU.row_offsets.raw(),
+                m_LU.m_larger_color_offsets.raw(),
+                m_LU.col_indices.raw(),
+                m_LU.diag.raw(),
+                m_LU.values.raw(),
+                this->m_delta.raw(),
+                this->m_Delta.raw(),
+                x.raw(),
+                LU_sorted_rows_by_color_ptr + color_offset,
+                num_rows_per_color,
+                i,
+                num_colors,
+                this->m_weight,
+                xIsZero);
+                // if(i == 0){
+                //     const char* filename = "v_3x3";
+                //     writeVector(filename,x);   
+                //     FatalError("Haven't implemented compute LU_forward_3x3 for Not EXPERIMENTAL_LU_FORWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+                // }
+        }
+        else
+        {
+            FatalError("Haven't implemented compute  LU_backward_3x3 for Col Major", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+
+#else
+        FatalError("Haven't implemented compute  LU_backward_3x3 for Not EXPERIMENTAL_LU_BACKWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+    }
+    cudaCheckError();
+}
+
+template<int CtaSize, int SMemSize, bool ROW_MAJOR, typename ValueTypeA >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 12 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void axpy_color(const ValueTypeA *x,
+                ValueTypeA *y,
+                double alpha,
+                const int *sorted_rows_by_color,
+                const int num_rows_per_color,
+                int blockDimx)
+{
+    // __shared__ volatile ValueTypeA s_x[SMemSize];
+    // __shared__ volatile ValueTypeA s_y[SMemSize];
+
+    int globalThreadId = blockIdx.x * blockDim.x + threadIdx.x;
+    int RowId = globalThreadId / blockDimx;
+    int VarId = globalThreadId % blockDimx;
+    int aRowId = sorted_rows_by_color[RowId];
+
+
+    if(RowId < num_rows_per_color){
+        y[aRowId * blockDimx + VarId] += alpha * x[aRowId * blockDimx + VarId];
+    }
+
+}
+
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_bxb(const VVector &b, VVector &x, bool xIsZero)
 {
     FatalError("Haven't implemented Multicolor DILU smoother for host format", AMGX_ERR_NOT_SUPPORTED_TARGET);
@@ -2330,7 +4679,7 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
 
         if (skipped_end)
         {
-            // delta = delta - LU*Delta smaller colors
+            // delta = delta - LU*delta smaller colors
             Cusparse::bsrmv(Cusparse::SMALLER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_delta, (ValueTypeA)1.0f, this->m_delta);
         }
 
@@ -2346,16 +4695,46 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     // --------------------
     // Backward Sweep
     // --------------------
+    const int CtaSize = 128; // Number of threads per CTA
+    const int SMemSize = 128;
+    const int nRows = CtaSize / m_LU.get_block_dimx();
     for (int i = num_colors - 1; i >= 0; i--)
     {
+        const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
+        const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
+        int GridSize = std::min( 2048, ( num_rows_per_color + nRows - 1 ) / nRows );
+
+        if ( GridSize == 0 )
+        {
+            continue;    // if perfect coloring (color 0 has no vertices)
+        }
+
         // delta = delta - LU*Delta larger colors
-        Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
+        if(skipped_end){
+            if ( xIsZero ){
+                //Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, x, (ValueTypeA)1.0f, this->m_delta);
+                Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
+            }
+            else{
+                Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
+            }
+        }
         // Multiple by inverse stored on diagonal
         Cusparse::bsrmv(Cusparse::DIAG_COL, i, (ValueTypeA) 1.0f, m_LU, this->m_delta, 0.0f, this->m_Delta);
-    }
+        
+        axpy_color<CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
+            this->m_Delta.raw(),
+            x.raw(),
+            (double)this->m_weight,
+            LU_sorted_rows_by_color_ptr + color_offset,
+            num_rows_per_color,
+            m_LU.get_block_dimx());
 
-    cudaCheckError();
-    axpy(this->m_Delta, x, this->m_weight, 0, x.size());
+        if (num_rows_per_color > 0)
+        {
+            skipped_end = true;
+        }
+    }
     cudaCheckError();
 }
 
