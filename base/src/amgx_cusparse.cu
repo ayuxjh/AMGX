@@ -897,10 +897,10 @@ void Cusparse::bsrmv_internal( ColumnColorSelector columnColorSelector,
         return;    // nothing to do, early exit
     }
 
-    if (columnColorSelector == DIAG_COL)
-    {
-        FatalError("DIAG_COL has been disabled to avoid allocating diag_offsets", AMGX_ERR_NOT_IMPLEMENTED);
-    }
+    // if (columnColorSelector == DIAG_COL)
+    // {
+    //     FatalError("DIAG_COL has been disabled to avoid allocating diag_offsets", AMGX_ERR_NOT_IMPLEMENTED);
+    // }
 
     const int *start_offsets, *end_offsets;
 
