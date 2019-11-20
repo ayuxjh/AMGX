@@ -2796,7 +2796,7 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
             }
 
             // Now load all column indices of neighbours that have colors smaller than yours
-            for ( int aColIt = aColBeg; aColIt < aColSmaller && lane_id_div_9 < 2; aColIt++)
+            for ( int aColIt = aColBeg; aColIt < aColSmaller; aColIt++)
             {
                 unsigned int active_mask = utils::activemask();
                 // Read the row to process, should be a broadcast
@@ -2810,8 +2810,8 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                     aColIdx = A_dia_indices[waRowId];
                 }
 
-
-                s_C_mtx[warpId][laneId] = A_nonzero_values[9 * aColIdx + lane_id_mod_9];
+                if( lane_id_div_9 < 2 )
+                    s_C_mtx[warpId][laneId] = A_nonzero_values[9 * aColIdx + lane_id_mod_9];
 
                 // Threads 0-8 perform the matrix product
                 ValueTypeA tmp(0);
@@ -2821,7 +2821,7 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                 {
 
 #pragma unroll
-                    for ( int m = 0 ; m < 3 ; ++m )
+                    for ( int m = 0 ; m < 3 && lane_id_div_9 < 2; ++m )
                     {
                         tmp += s_C_mtx[warpId][9 + 3 * idx_i + m] * s_C_mtx[warpId][3 * m + idx_j];
                     }
@@ -2849,7 +2849,7 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                 int waColEnd = ld_cg(A_row_offsets + waRowId + 1);
 
                 // Load the first 32 columns of waRowId
-                for (waColIt += laneId ; utils::any(waColIt < waColEnd, active_mask ); waColIt += 18 )
+                for (waColIt += laneId ; utils::any(waColIt < waColEnd, active_mask ); waColIt += 32 )
                 {
                     // Each thread loads its column id
                     int waColId = -1;
@@ -2893,8 +2893,9 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                     const int n_cols = __popc( vote );
 
                     // Process all columns that have been found
-                    for ( int k = 0 ; k < n_cols ; k += 2 )
+                    for ( int k = 0 ; k < n_cols &&  lane_id_div_9 < 2; k += 2 )
                     {
+                        unsigned int active_mask_2 = utils::activemask();
                         const int my_k = k + lane_id_div_9;
                         // Where to get columns from.
                         int a_col_it = -1, w_col_it = -1;
@@ -2906,8 +2907,8 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                             w_col_it = s_waColItToLoad[warpId][my_k];
                         }
 #else
-                        a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask);
-                        w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask);
+                        a_col_it = utils::shfl(found_aColIt, s_aColSrc[warpId][my_k], warpSize, active_mask_2);
+                        w_col_it = utils::shfl(waColIt,      s_aColSrc[warpId][my_k], warpSize, active_mask_2);
 
                         if ( my_k >= n_cols )
                         {
@@ -2927,7 +2928,7 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
                              s_C_mtx[warpId][laneId] = my_C;
                         // Run the matrix-matrix product.
                         ValueTypeA tmp(0);
-                        utils::syncwarp( active_mask );
+                        utils::syncwarp( active_mask_2 );
 
                         if (ROW_MAJOR)
                         {
