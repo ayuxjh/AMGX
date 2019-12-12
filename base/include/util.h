@@ -26,7 +26,7 @@
  */
 
 #pragma once
-
+#include <stdio.h>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -34,7 +34,11 @@
 #include <misc.h>
 #include <error.h>
 #include <basic_types.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/copy.h>
 #include <thrust/reduce.h>
+#include <vector>
 #include <matrix.h>
 #include <limits>
 
@@ -42,6 +46,8 @@
 
 #define STR_EXPAND(tok) #tok
 #define STR(tok) STR_EXPAND(tok)
+using namespace std;
+
 
 namespace amgx
 {
@@ -49,6 +55,29 @@ namespace amgx
 /****************************************************
  * Debugging tools
  ***************************************************/
+template<class TConfig>
+void writeVectorBinary(const char *fname, const Vector<TConfig> &v)
+{
+    FILE *bfile;
+
+    typedef typename TConfig::template setMemSpace<AMGX_host>::Type TConfig_h;
+    Vector<TConfig_h> v_h(v);
+    
+    printf("vector(host) constructed\n");
+
+    if((bfile = fopen(fname,"wb")) == NULL)
+        {
+            printf("can not open file\n");
+        }
+
+    int v_h_size = v_h.size();
+    fwrite(&v_h_size,sizeof(v_h_size),1,bfile);
+
+    fwrite(&v_h[0],sizeof(v_h[0])* v_h.size(),1,bfile);
+
+    fclose(bfile);
+}
+
 template<class TConfig>
 void writeVector(const char *fname, const Vector<TConfig> &v)
 {
@@ -67,6 +96,52 @@ void writeVector(const char *fname, const Vector<TConfig> &v)
 
     fout << std::endl;
     fout.close();
+}
+
+template<class TConfig,class IConfig>
+void writeVectorBycolor(const char *fname, const Vector<TConfig> &v_value,const Vector<IConfig> row_ptr,const Vector<IConfig> &sorted_rows_by_color,int offset,int num_rows_per_color,int color,int blockDim)
+{
+    typedef typename TConfig::template setMemSpace<AMGX_host>::Type TConfig_h;
+    
+    // Vector<TConfig_h> v_h(v_value);
+    Vector<TConfig_h> v_h;
+    v_h.copy(v_value);
+    
+    FILE *bfile;
+
+    if((bfile = fopen(fname,"wb")) == NULL)
+        {
+            printf("can not open file\n");
+        }
+
+    int n_cols = 0;
+    
+    for(int i = 0; i < num_rows_per_color; i++)
+    {
+        int RowId = sorted_rows_by_color[offset + i];
+        int ColBeg = row_ptr[RowId];
+        int ColEnd = row_ptr[RowId + 1];
+        int num_cols = ColEnd - ColBeg;
+        n_cols += num_cols;
+
+    }
+
+    fwrite(&n_cols,sizeof(n_cols),1,bfile);
+    printf("write %d total cols\n",n_cols);
+    for(int i = 0; i < num_rows_per_color; i++)
+        {
+            int RowId = sorted_rows_by_color[offset + i];
+            int blockSq = blockDim  * blockDim;
+            int ColBeg = row_ptr[RowId];
+            int ColEnd = row_ptr[RowId + 1];
+            int num_cols = ColEnd - ColBeg;
+
+            fwrite(&v_h[ColBeg * blockSq],sizeof(v_h[ColBeg * blockSq])* blockSq * num_cols,1,bfile);
+
+
+        }
+        fclose(bfile);
+ 
 }
 
 template<class TConfig>

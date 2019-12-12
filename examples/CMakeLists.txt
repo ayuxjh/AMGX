@@ -53,16 +53,21 @@ ELSE(CMAKE_C_COMPILER_NAME MATCHES cl)
 ENDIF(CMAKE_C_COMPILER_NAME MATCHES cl)
 
 ADD_EXECUTABLE(amgx_capi amgx_capi.c)
+ADD_EXECUTABLE(amgx_capi_su amgx_capi_su.c)
 
 target_link_libraries ( amgx_capi ${dyn_libs} )
+target_link_libraries ( amgx_capi_su ${dyn_libs} )
 
 IF(WIN32)
     IF(MSVC)
       set_source_files_properties( amgx_capi.c PROPERTIES LANGUAGE CXX)
       set_target_properties ( amgx_capi PROPERTIES LINKER_LANGUAGE CXX )
+      set_source_files_properties( amgx_capi_su.c PROPERTIES LANGUAGE CXX)
+      set_target_properties ( amgx_capi_su PROPERTIES LINKER_LANGUAGE CXX )
     ENDIF(MSVC)
 ELSE(WIN32)
   SET_SOURCE_FILES_PROPERTIES( amgx_capi.c PROPERTIES COMPILE_FLAGS -std=c99 )
+  SET_SOURCE_FILES_PROPERTIES( amgx_capi_su.c PROPERTIES COMPILE_FLAGS -std=c99 )
 ENDIF(WIN32)
 
 
@@ -146,6 +151,7 @@ if(MPI_FOUND)
 endif(MPI_FOUND)
 
 install(TARGETS amgx_capi DESTINATION "lib/examples")
+install(TARGETS amgx_capi_su DESTINATION "lib/examples")
 if(MPI_FOUND)
   install(TARGETS amgx_mpi_capi amgx_mpi_capi_agg amgx_mpi_capi_cla amgx_mpi_poisson7 DESTINATION "lib/examples")
 endif(MPI_FOUND)
