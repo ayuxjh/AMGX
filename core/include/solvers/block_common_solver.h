@@ -398,14 +398,10 @@ void compute_block_inverse_row_major3x3_formula2( volatile ValueType *s_Amat, co
         if (isNotCloseToZero(det) )
         {
             Einv[e_offset] = cofactor / det;
-            if(e_offset > 10726280 && e_offset < 10726290)
-                printf("run first way %d %d %lf %lf || %lf %lf %lf || my_A %lf\n",i_ind,j_ind,cofactor,det,s_A(0, 0),s_A(0, 1),s_A(0, 2),my_A);
         }
         else
         {
             Einv[e_offset] = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
-            if(e_offset > 10726280 && e_offset < 10726290)
-                printf("run second way %d %d %lf %lf || %lf %lf %lf || my_A %lf\n",i_ind,j_ind,cofactor,det,s_A(0, 0),s_A(0, 1),s_A(0, 2),my_A);
         }
 
         //Einv[e_offset] = cofactor/epsilon(det);
