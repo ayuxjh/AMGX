@@ -2755,6 +2755,7 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
 #endif
     // Shared memory to store the column indices of the current row
     __shared__ volatile int s_keys[nWarps][SMemSize];
+    bool exShare = false;
 
     while (globalWarpId < num_rows_per_color)
     {
@@ -2771,12 +2772,11 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
             // The number of columns.
             const int nCols = aColEnd - aColBeg;
 
-            //TODO: Add fallback for cases where number of nonzeros exceed SMemSize
             if ( nCols > SMemSize )
             {
-                printf("nclos is %d\n",nCols);
-                wk_returnValue[0] = 1;
-                return;
+                exShare = true;
+                // wk_returnValue[0] = 1;
+                // return;
             }
 
             // Fill-in the local table.
@@ -2865,10 +2865,17 @@ compute_LU_factors_3x3_kernel_warp( int A_nRows,
 
 #pragma unroll 4
                     for ( int i = 0, num_keys = aColEnd - aColBeg ; i < num_keys ; ++i )
-                        if ( s_keys[warpId][i] == waColId )
+                        if ( exShare == false )
                         {
-                            found_aColIt = i;
+                             if ( s_keys[warpId][i] == waColId )
+                                found_aColIt = i;
                         }
+                        else
+                        {
+                             if (  A_col_indices[aColBeg + i] == waColId )
+                                found_aColIt = i;
+                        }
+                        
 
                     if ( found_aColIt != -1 )
                     {
