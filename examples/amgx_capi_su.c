@@ -405,102 +405,128 @@ int main(int argc, const char **argv)
         errAndExit("ERROR: no linear system was specified");
     }
 
+    // // FILE *fp_row_ptr;
+    // // if((fp_row_ptr = fopen("./bin/row_ptr.dat","rb")) == NULL){
+    // //             printf("cannot open the file row_ptr.dat");
+    // //     }
+    
+    // // FILE *fp_col_ind;
+    // // if((fp_col_ind = fopen("./bin/col_ind.dat","rb")) == NULL){
+    // //             printf("cannot open the file col_ind.dat");
+    // //     }
+    
+    // // FILE *fp_value;
+    // // if((fp_value = fopen("./bin/value.dat","rb")) == NULL){
+    // //             printf("cannot open the file value.dat");
+    // //     }
+    
+    // // fscanf(fp_row_ptr,"%d ",&n);
+    // // n--;
+    // // fscanf(fp_col_ind,"%d ",&nnz);
+    // // fscanf(fp_value,"%d ",&nnz);
+
+    // // int *row_ptr = (int *)malloc(sizeof(int) * (n+1));
+    // // int *col_ind = (int *)malloc(sizeof(int) * nnz);
+    // // double *data = (double *)malloc(sizeof(double) * bsize_x  * bsize_y * nnz);
+
+    // // for(int i = 0; i < n+1; i++)
+    // // {
+    // //     fscanf(fp_row_ptr,"%d ",&row_ptr[i]);
+    // // }
+    // // fclose(fp_row_ptr);
+    // // printf("row_ptr read\n");
+
+    // // for(int i = 0; i < nnz; i++)
+    // // {
+    // //     fscanf(fp_col_ind,"%d ",&col_ind[i]);
+    // // }
+    // // fclose(fp_col_ind);
+    // // printf("col_ind read\n");
+
+    // // for(int i = 0; i < nnz * bsize_x * bsize_y; i++)
+    // // {
+    // //     fscanf(fp_value,"%lf ",&data[i]);
+   
+    // // }
+    // // fclose(fp_value); 
+    // // printf("value read\n");
+
     FILE *fp_row_ptr;
-    if((fp_row_ptr = fopen("./bin/row_ptr.dat","r")) == NULL){
+    if((fp_row_ptr = fopen("./bin/row_ptr.dat","rb")) == NULL){
                 printf("cannot open the file row_ptr.dat");
         }
     
     FILE *fp_col_ind;
-    if((fp_col_ind = fopen("./bin/col_ind.dat","r")) == NULL){
+    if((fp_col_ind = fopen("./bin/col_ind.dat","rb")) == NULL){
                 printf("cannot open the file col_ind.dat");
         }
     
     FILE *fp_value;
-    if((fp_value = fopen("./bin/value.dat","r")) == NULL){
+    if((fp_value = fopen("./bin/value.dat","rb")) == NULL){
                 printf("cannot open the file value.dat");
         }
-    
-    fscanf(fp_row_ptr,"%d ",&n);
-    n--;
-    fscanf(fp_col_ind,"%d ",&nnz);
-    fscanf(fp_value,"%d ",&nnz);
 
-    int *row_ptr = (int *)malloc(sizeof(int) * (n+1));
-    int *col_ind = (int *)malloc(sizeof(int) * nnz);
-    double *data = (double *)malloc(sizeof(double) * bsize_x  * bsize_y * nnz);
+    FILE *fp_RHS;
+    if((fp_RHS = fopen("./bin/b.dat","rb")) == NULL){
+                printf("cannot open the file value.dat");
+        }
 
-    for(int i = 0; i < n+1; i++)
-    {
-        fscanf(fp_row_ptr,"%d ",&row_ptr[i]);
-    }
+    unsigned long num_size,nnz_col,nnz_value,num_RHS;
+    int  num_size_i,nnz_col_i,nnz_value_i,num_RHS_i;
+
+    fread(&num_size,sizeof(num_size),1,fp_row_ptr);
+    fread(&nnz_col,sizeof(nnz_col),1,fp_col_ind);
+    fread(&nnz_value,sizeof(nnz_value),1,fp_value);
+    fread(&num_RHS,sizeof(num_RHS),1,fp_RHS);
+
+    num_size_i = (int) num_size;
+    nnz_col_i = (int) nnz_col;
+    nnz_value_i = (int) nnz_value;
+    num_RHS_i = (int) num_RHS;
+
+    // printf("%d %d %d %d",num_size_i,nnz_col_i,nnz_value_i,num_RHS_i);
+
+    unsigned long *row_ptr = (unsigned long *)malloc(sizeof(unsigned long) * (num_size+1));
+    unsigned long *col_ind = (unsigned long *)malloc(sizeof(unsigned long) * nnz_col);
+    double *data = (double *)malloc(sizeof(double) * bsize_x  * bsize_y * nnz_value);
+    double *RHS = (double *)malloc(sizeof(double) * num_RHS);
+
+    //** transfer
+    int *row_ptr_i = (int *)malloc(sizeof(int) * (num_size+1));
+    int *col_ind_i = (int *)malloc(sizeof(int) * nnz_col);
+
+    fread(&row_ptr[0],sizeof(row_ptr[0])* ( num_size + 1 ),1,fp_row_ptr);
+
+    for(int i = 0; i < num_size + 1; i++)
+        row_ptr_i[i] = row_ptr[i];
+
     fclose(fp_row_ptr);
-    printf("row_ptr read\n");
 
-    for(int i = 0; i < nnz; i++)
-    {
-        fscanf(fp_col_ind,"%d ",&col_ind[i]);
-    }
+    printf("row_ptr read %ld rows\n",num_size);
+
+    fread(&col_ind[0],sizeof(col_ind[0])* ( nnz_col ),1,fp_col_ind);
+
+    for(int i = 0; i < nnz_col; i++)
+        col_ind_i[i] = col_ind[i];
+
     fclose(fp_col_ind);
-    printf("col_ind read\n");
+    printf("col_ind read %ld cols\n",nnz_col);
 
-    for(int i = 0; i < nnz * bsize_x * bsize_y; i++)
-    {
-        fscanf(fp_value,"%lf ",&data[i]);
-   
-    }
+    fread(&data[0],sizeof(data[0])* ( bsize_x  * bsize_y * nnz_value ),1,fp_value);
+    
+
+    
     fclose(fp_value); 
-    printf("value read\n");
+    printf("value read %d values\n",nnz_value);
 
+    /*upload the right hand vector*/
 
-        // if((fp_row_ptr = fopen("./bin/row_ptr_2.dat","w")) == NULL){
-        //             printf("cannot open the file row_ptr.dat");
-        //     }
-        
-        // if((fp_col_ind = fopen("./bin/col_ind_2.dat","w")) == NULL){
-        //             printf("cannot open the file col_ind.dat");
-        //     }
+    fread(&RHS[0],sizeof(RHS[0])* ( num_RHS ),1,fp_RHS);
+    fclose(fp_RHS);
+    printf("RHS read %d\n",num_RHS);
     
-        // if((fp_value = fopen("./bin/value_2.dat","w")) == NULL){
-        //             printf("cannot open the file value.dat");
-        //     }
-
-
-
-
-        // int count_rowptr = 0;
-        // fprintf(fp_row_ptr,"%d\n",count_rowptr);
-        // for(int i = 0; i < 32; i++){
-        //     int count_nCols = 0;
-        //     int j_start = row_ptr[i];
-        //     int j_end = row_ptr[i+1];
-
-        //     for(int j = j_start; j < j_end; j ++){
-        //         if(col_ind[j] < 32){
-        //             count_nCols++;
-        //             fprintf(fp_col_ind,"%d\n",col_ind[j]);
-        //             for(int k = 0; k < 25; k++)
-        //                 fprintf(fp_value,"%lf\n", data[j*25 + k]);
-
-        //         }
-                
-        //     }
-        //     count_rowptr += count_nCols;
-        //     fprintf(fp_row_ptr,"%d\n",count_rowptr);
-
-        // }
-
-        // fclose(fp_row_ptr);
-        // fclose(fp_col_ind);
-        // fclose(fp_value); 
-
-
-    // FILE *fp_value_2;
-    // if((fp_value = fopen("./bin/value_2.dat","rw")) == NULL){
-    //             printf("cannot open the file value.dat");
-    //     }
-    
-    // fclose(fp_value_2); 
-
+ 
+ 
 
 
 
@@ -551,35 +577,11 @@ int main(int argc, const char **argv)
         if (row_coloring) { free(row_coloring); }
     }
     /*upload the matrix*/
-    AMGX_matrix_upload_all(A, n, nnz, bsize_x, bsize_y, row_ptr, col_ind, data, 0);
-    /*upload the right hand vector*/
-    double *RHS = (double *)malloc(sizeof(double) * bsize_x  * n);
+    AMGX_matrix_upload_all(A, num_size, nnz_value, bsize_x, bsize_y, row_ptr_i, col_ind_i, data, 0);
 
-    FILE *fp_RHS;
-    if((fp_RHS = fopen("./bin/b.dat","r")) == NULL){
-                printf("cannot open the file value.dat");
-        }
-
-    long int RHS_size;
-    fscanf(fp_RHS,"%d",&RHS_size);
-    for(int i = 0; i < RHS_size; i++)
-    {
-        fscanf(fp_RHS,"%lf ",&RHS[i]);
-        // if(i%5 == 0)
-        //     RHS[i] = 1.0;
-        // else
-        //     RHS[i] = 0.0;
-
-            
-    }
-    fclose(fp_RHS);
-    printf("RHS read %d\n",n);
-    
-
-
-    AMGX_vector_upload(b, n, bsize_x,RHS);
+    AMGX_vector_upload(b, num_size, bsize_x,RHS);
     /*set the solutino vectoe zero*/
-    AMGX_vector_set_zero(x, n, bsize_x);
+    AMGX_vector_set_zero(x, num_size, bsize_x);
     // AMGX_vector_set_zero(b, n, bsize_x);
     /* solver setup */
     AMGX_solver_setup(solver, A);
@@ -618,6 +620,6 @@ int main(int argc, const char **argv)
 #ifdef AMGX_DYNAMIC_LOADING
     amgx_libclose(lib_handle);
 #endif
-    //CUDA_SAFE_CALL(cudaDeviceReset());
+    // CUDA_SAFE_CALL(cudaDeviceReset());
     return status;
 }

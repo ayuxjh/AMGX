@@ -78,6 +78,7 @@ class MulticolorILUSolver_Base : public Solver<T_Config>
         virtual void smooth_4x4(const VVector &b, VVector &x, bool xIsZero) = 0;
         virtual void smooth_bxb(const VVector &b, VVector &x, bool xIsZero) = 0;
         virtual void smooth_3x3(const VVector &b, VVector &x, bool xIsZero) = 0;
+        virtual void smooth_5x5(const VVector &b, VVector &x, bool xIsZero) = 0;
 
         Matrix<T_Config> *m_explicit_A;
         int m_use_bsrxmv;
@@ -148,6 +149,7 @@ class MulticolorILUSolver< TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_ind
         void smooth_4x4( const VVector &b, VVector &x, bool xIsZero);
         void smooth_bxb( const VVector &b, VVector &x, bool xIsZero);
         void smooth_3x3( const VVector &b, VVector &x, bool xIsZero);
+        void smooth_5x5( const VVector &b, VVector &x, bool xIsZero);
 };
 
 // ----------------------------
@@ -180,6 +182,7 @@ class MulticolorILUSolver< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_i
         void smooth_4x4(const VVector &b, VVector &x, bool xIsZero);
         void smooth_bxb(const VVector &b, VVector &x, bool xIsZero);
         void smooth_3x3(const VVector &b, VVector &x, bool xIsZero);        
+        void smooth_5x5(const VVector &b, VVector &x, bool xIsZero);  
 };
 
 template<class T_Config>
