@@ -56,6 +56,24 @@ namespace amgx
  * Debugging tools
  ***************************************************/
 template<class TConfig>
+void writeBinary(const char *fname, TConfig v)
+{
+    FILE *bfile;
+
+    printf("vatiable (host) constructed\n");
+
+    if((bfile = fopen(fname,"wb")) == NULL)
+        {
+            printf("can not open file\n");
+        }
+
+
+    fwrite(&v,sizeof(v),1,bfile);
+
+    fclose(bfile);
+}
+
+template<class TConfig>
 void writeVectorBinary(const char *fname, const Vector<TConfig> &v)
 {
     FILE *bfile;
