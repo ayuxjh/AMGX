@@ -68,6 +68,15 @@ struct is_zero
     }
 };
 
+struct subone_functor
+{
+    __host__ __device__
+    int operator()(int& x,int& y)
+    {
+        return  x - 1;
+    }
+};
+
 // ---------------------------
 // Kernels
 // ---------------------------
@@ -425,15 +434,18 @@ void MinMaxMatrixColoring<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_in
     profileSubphaseMatrixColoring();
     const int num_rows =  A.get_num_rows();
     int max_uncolored_rows = (int) (this->m_uncolored_fraction * ((ValueType) num_rows));
+    max_uncolored_rows = 1;
     IndexType *row_colors_ptr = this->m_row_colors.raw();
     const int threads_per_block = 256;
     const int warps_per_block = threads_per_block / 32;
     const int num_blocks = min( AMGX_GRID_MAX_SIZE, (num_rows + warps_per_block - 1) / warps_per_block );
     this->m_num_colors = 1;
     thrust::fill(this->m_row_colors.begin(), this->m_row_colors.end(), 0);
+    int num_uncolored = 0;
+
     cudaCheckError();
 
-    for ( int num_uncolored = num_rows; num_uncolored > max_uncolored_rows ; )
+    for ( num_uncolored = num_rows; num_uncolored > max_uncolored_rows ; )
     {
 #ifdef USE_EXPERIMENTAL_MIN_MAX
         colorRowsKernel<IndexType, threads_per_block> <<< num_blocks, threads_per_block, 0, thrust::global_thread_handle::get_stream()>>>(
@@ -450,7 +462,13 @@ void MinMaxMatrixColoring<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_in
         num_uncolored = (int) thrust::count_if( this->m_row_colors.begin(), this->m_row_colors.begin() + num_rows, is_zero() );
         cudaCheckError();
     }
-
+    
+    if(num_uncolored == 0)
+    {
+        thrust::transform( this->m_row_colors.begin(), this->m_row_colors.begin() + num_rows, this->m_row_colors.begin(), this->m_row_colors.begin(),subone_functor() );
+        cudaCheckError();
+    }
+    
     this->m_num_colors = thrust::reduce( this->m_row_colors.begin(), this->m_row_colors.begin() + num_rows, 0, thrust::maximum<int>() ) + 1;
     cudaCheckError();
 }
