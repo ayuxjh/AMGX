@@ -760,6 +760,359 @@ void LU_forward_3x3_kernel_warp( const IndexType *LU_row_offsets,
     FatalError("Haven't implemented LU_forward_3x3 for not EXPERIMENTAL_LU", AMGX_ERR_NOT_SUPPORTED_TARGET);
 #endif
 
+#ifdef EXPERIMENTAL_LU_FORWARD
+
+template<typename IndexType, typename ValueTypeA, typename ValueTypeB, int CtaSize, int bsize, bool ROW_MAJOR, bool hasDiag>
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 16 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void LU_forward_5x5_kernel_warp( const IndexType *LU_row_offsets,
+                                 const IndexType *LU_smaller_color_offsets,
+                                 const IndexType *LU_column_indices,
+                                 const ValueTypeA *LU_nonzero_values,
+                                 const IndexType *A_row_offsets,
+                                 const IndexType *A_column_indices,
+                                 const ValueTypeA *A_nonzero_values,
+                                 const IndexType *A_dia_indices,
+                                 const ValueTypeB *x,
+                                 const ValueTypeB *b,
+                                 ValueTypeB *delta,
+                                 const int *sorted_rows_by_color,
+                                 const int num_rows_per_color,
+                                 const int current_color,
+                                 bool xIsZero )
+{
+    const int nWarps = CtaSize / 32; // Number of warps per Cta
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    const int laneId_div_5 = laneId / 5 ;
+    const int laneId_mod_5 = laneId % 5 ;
+
+// #if __CUDA_ARCH__ < 300
+//     // // Shared memory to broadcast column IDs.
+//     // __shared__ volatile int s_aColIds[CtaSize];
+//     // // Each thread keeps its own pointer.
+//     // volatile int *my_s_aColIds = &s_aColIds[16 * halfWarpId];
+// #else
+//     // const int upperHalf = 16 * (laneId / 16);
+// #endif
+    // Shared memory needed to exchange X and delta.
+    __shared__ volatile ValueTypeB s_mem[CtaSize];
+    // Each thread keeps its own pointer to shared memory to avoid some extra computations.
+    volatile ValueTypeB *my_s_mem = &s_mem[32 * warpId];
+
+    // Iterate over the rows of the matrix. One warp per row.
+    for ( int aRowIt = blockIdx.x * nWarps + warpId ; aRowIt < num_rows_per_color ; aRowIt += gridDim.x * nWarps )
+    {
+        int aRowId = sorted_rows_by_color[aRowIt];
+        // Load one block of B.
+        ValueTypeB my_bmAx(0);
+        ValueTypeB my_bmAx_2(0);
+
+        unsigned int active_mask = utils::activemask();
+
+        if ( ROW_MAJOR )
+        {
+            if ( laneId_mod_5 == 0 && laneId_div_5 < 5)
+            {
+                my_bmAx = __cachingLoad(&b[5 * aRowId + laneId_div_5]);
+
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     my_bmAx = __cachingLoad(&b[4 * aRowId + halfLaneId_mod_4]);
+            // }
+        }
+
+        // Don't do anything if X is zero.
+        if ( !xIsZero )
+        {
+            int aColBegin = A_row_offsets[aRowId  ];
+            int aColEnd   = A_row_offsets[aRowId + 1];
+            int aColMax = aColEnd;
+
+            if ( hasDiag )
+            {
+                ++aColMax;
+            }
+
+            // Each warp load column indices of 32 nonzero blocks
+            for ( ; utils::any( aColBegin < aColMax, active_mask ) ; aColBegin += 32 )
+            {
+                int aColIt = aColBegin + laneId;
+                // Get the ID of the column.
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = A_column_indices[aColIt];
+                }
+
+                if ( hasDiag && aColIt == aColEnd )
+                {
+                    aColId = aRowId;
+                }
+
+#if __CUDA_ARCH__ < 300
+                // my_s_aColIds[halfLaneId] = aColId;
+#endif
+                // Count the number of active columns.
+                int vote =  utils::ballot(aColId != -1, active_mask);
+                // The number of iterations.
+                // int nCols = max( __popc( vote & 0x0000ffff ), __popc( vote & 0xffff0000 ) );
+                int nCols = __popc( vote & 0xffffffff );
+
+                // Loop over columns. We compute 5 columns per iteration.
+                for ( int k = 0 ; k < nCols; k += 5 )
+                {
+                    int my_k = k + laneId_div_5;
+                    // Load 8 blocks of X.
+#if __CUDA_ARCH__ < 300
+                    int waColId = -1; 
+                    // int waColId = my_s_aColIds[my_k];
+#else
+                    int waColId = utils::shfl( aColId, my_k, warpSize, active_mask );
+#endif
+                    if ( ! (laneId_div_5 < 5 ) || ! (my_k < nCols ) )
+                        waColId = -1;
+
+                    ValueTypeB my_x(0);
+
+                    if ( waColId != -1 )
+                    {
+                        if (laneId_div_5 < 5)
+                            my_x = __cachingLoad(&x[5 * waColId + laneId_mod_5 ]);
+                    }
+
+                    my_s_mem[laneId] = my_x;
+                    utils::syncwarp();
+                    // Load 5 blocks of A.
+#pragma unroll
+                    for ( int i = 0 ; i < 5 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        if ( hasDiag && w_aColTmp == aColEnd )
+                        {
+                            w_aColIt = A_dia_indices[aRowId];
+                        }
+
+                        ValueTypeA my_val(0);
+
+                        if ( w_aColIt != -1 )
+                        {
+                            if ( laneId_div_5 < 5 )
+                                my_val = A_nonzero_values[25 * w_aColIt + laneId];
+                        }
+
+                        if ( ROW_MAJOR )
+                        {
+                            if ( laneId_div_5 < 5 )
+                                my_bmAx -= my_val * my_s_mem[5 * i + laneId_mod_5];
+                        }
+                        else
+                        {
+                            // my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_div_4];
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+        } // if xIsZero
+
+        // Contribution from each nonzero column that has color less than yours
+        if ( current_color != 0 )
+        {
+            // TODO: Use constant or texture here
+            int aColBegin = LU_row_offsets[aRowId];
+            int aColEnd   = LU_smaller_color_offsets[aRowId];
+
+            // Each warp load column indices of 32 nonzero blocks
+            for ( ; utils::any( aColBegin < aColEnd, active_mask ) ; aColBegin += 32 )
+            {
+                int aColIt = aColBegin + laneId;
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = LU_column_indices[aColIt];
+                }
+
+#if __CUDA_ARCH__ < 300
+                // my_s_aColIds[halfLaneId] = aColId;
+#endif
+
+                // Count the number of active columns.
+                int vote =  utils::ballot(aColId != -1, active_mask);
+                // The number of iterations.
+                int nCols = __popc( vote & 0xffffffff );
+
+                for ( int k = 0 ; k < nCols ; k += 5 )
+                {
+                    int my_k = k + laneId_div_5;
+                    // Load 8 blocks of X.
+#if __CUDA_ARCH__ < 300
+                    int waColId = -1; 
+                    // int waColId = my_s_aColIds[my_k];
+#else
+
+                    int waColId = utils::shfl( aColId, my_k, warpSize, active_mask );
+
+#endif
+                    if ( ! (laneId_div_5 < 5 ) || ! (my_k < nCols ) )
+                        waColId = -1;
+
+                    ValueTypeB my_delta(0);
+
+                    if ( waColId != -1 )
+                    {
+                        if(laneId_div_5 < 5)
+                            my_delta = delta[5 * waColId + laneId_mod_5];
+                    }
+
+                    my_s_mem[laneId] = my_delta;
+                    utils::syncwarp(); // making sure smem write propagated
+                    // Update b-Ax.
+#pragma unroll
+                    for ( int i = 0 ; i < 5 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        ValueTypeA my_val(0);
+
+                        if ( w_aColIt != -1 )
+                        {
+                            if(laneId_div_5 < 5)
+                                my_val = LU_nonzero_values[25 * w_aColIt + laneId];
+                        }
+
+                        if ( ROW_MAJOR )
+                        {
+                            if(laneId_div_5 < 5)
+                                my_bmAx -= my_val *  my_s_mem[5 * i + laneId_mod_5];
+                        }
+                        else
+                        {
+                            // my_bmAx -= my_val * my_s_mem[5 * i + halfLaneId_div_4];
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+        } // If current_color != 0
+
+
+
+        // Reduce bmAx terms.
+#if __CUDA_ARCH__ >= 300
+        my_bmAx_2 = my_bmAx;
+        s_mem[threadIdx.x] = my_bmAx_2;
+
+        if ( ROW_MAJOR )
+        {
+            // __syncwarp();
+
+            // if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+            
+            // __syncwarp();
+
+            // if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+            
+            // __syncwarp();
+
+            // if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+            
+            // __syncwarp();
+
+__syncwarp();
+
+                if ( laneId < 24 ) { my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+                
+                __syncwarp();
+
+                if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+                __syncwarp();
+
+                if ( laneId < 23 ) { my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+                
+                __syncwarp();
+
+                if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+                __syncwarp();
+
+                if ( laneId < 21 ) { my_bmAx += s_mem[threadIdx.x + 1]; }
+                
+                __syncwarp();
+
+                if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx; }
+                
+                __syncwarp();
+            
+
+        }
+        else
+        {
+            // my_bmAx += utils::shfl_xor( my_bmAx, 4, warpSize, active_mask );
+            // my_bmAx += utils::shfl_xor( my_bmAx, 8, warpSize, active_mask );
+        }
+
+#else
+        // s_mem[threadIdx.x] = my_bmAx_2;
+
+        // if ( ROW_MAJOR )
+        // {
+        //     if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+
+        //     if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+        //     if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+        // }
+        // else
+        // {
+        //     if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+        //     if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+        // }
+
+#endif
+
+        // Store the results.
+        if ( ROW_MAJOR )
+        {
+            if ( laneId_mod_5 == 0 && laneId_div_5 < 5 )
+            {
+                delta[5 * aRowId + laneId_div_5] = my_bmAx;
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     delta[4 * aRowId + halfLaneId_mod_4] = my_bmAx;
+            // }
+        }
+    }
+}
+
+#else
+        FatalError("Haven't implemented LU_forward_5x5 for not EXPERIMENTAL_LU", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
 
 #ifdef EXPERIMENTAL_LU_BACKWARD
 
@@ -1176,6 +1529,413 @@ void LU_backward_4x4_kernel(const IndexType *row_offsets, const IndexType *large
 }
 
 #endif
+
+#ifdef EXPERIMENTAL_LU_BACKWARD
+
+template< typename IndexType, typename ValueTypeA, typename ValueTypeB, int CtaSize, bool ROW_MAJOR >
+__global__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+__launch_bounds__( CtaSize, 16 )
+#elif defined(__CUDA_ARCH__)
+__launch_bounds__( CtaSize, 8 )
+#endif
+void LU_backward_5x5_kernel_warp( const IndexType *row_offsets,
+                                  const IndexType *larger_color_offsets,
+                                  const IndexType *column_indices,
+                                  const IndexType *dia_indices,
+                                  const ValueTypeA *nonzero_values,
+                                  const ValueTypeB *delta,
+                                  ValueTypeB *Delta,
+                                  ValueTypeB *x,
+                                  const int *sorted_rows_by_color,
+                                  const int num_rows_per_color,
+                                  const int current_color,
+                                  const int num_colors,
+                                  const ValueTypeB weight,
+                                  bool xIsZero )
+{
+    const int nWarps = CtaSize / 32; // Number of half warps per CTA.
+    const int warpId = utils::warp_id();
+    const int laneId = utils::lane_id();
+    const int laneId_div_5 = laneId / 5;
+    const int laneId_mod_5 = laneId % 5;
+
+// #if __CUDA_ARCH__ < 300
+//     // // Shared memory to broadcast column IDs.
+//     // __shared__ volatile int s_aColIds[CtaSize];
+//     // // Each thread keeps its own pointer.
+//     // volatile int *my_s_aColIds = &s_aColIds[16 * halfWarpId];
+// #else
+//     // const int upperHalf = 16 * (laneId / 16);
+// #endif
+    // Shared memory needed to exchange X and delta.
+    __shared__ volatile ValueTypeB s_mem[CtaSize];
+    // Each thread keeps its own pointer to shared memory to avoid some extra computations.
+    volatile ValueTypeB *my_s_mem = &s_mem[32 * warpId];
+
+    // Iterate over the rows of the matrix. One warp per two rows.
+    for ( int aRowIt = blockIdx.x * nWarps + warpId ; aRowIt < num_rows_per_color ; aRowIt += gridDim.x * nWarps )
+    {
+        int aRowId = sorted_rows_by_color[aRowIt];
+        unsigned int active_mask = utils::activemask();
+        // Load one block of B.
+        ValueTypeB temp_mul(0);
+        ValueTypeB my_bmAx(0);
+        ValueTypeB my_bmAx_2(0);
+                    utils::syncwarp();
+        if ( ROW_MAJOR )
+        {
+            if ( laneId_mod_5 == 0 && laneId_div_5 < 5 )
+            {
+                my_bmAx = delta[5 * aRowId + laneId_div_5];
+            }
+        }
+        else
+        {
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     my_bmAx = delta[4 * aRowId + halfLaneId_mod_4];
+            // }
+        }
+                    utils::syncwarp();
+        // Don't do anything if the color is not the interesting one.
+        if ( current_color != num_colors - 1 )
+        {
+            // The range of the rows.
+            int aColBegin = larger_color_offsets[aRowId];
+            int aColEnd   = row_offsets[aRowId + 1];
+
+            // Each warp load column indices of 16 nonzero blocks
+            for ( ; utils::any( aColBegin < aColEnd, active_mask ) ; aColBegin += 32 )
+            {
+                int aColIt = aColBegin + laneId;
+                // Get the ID of the column.
+                int aColId = -1;
+
+                if ( aColIt < aColEnd )
+                {
+                    aColId = column_indices[aColIt];
+                }
+                    utils::syncwarp();
+#if __CUDA_ARCH__ < 300
+                // my_s_aColIds[halfLaneId] = aColId;
+#endif
+                int vote =  utils::ballot(aColId != -1, active_mask);
+                int nCols = __popc( vote & 0xffffffff );
+                    utils::syncwarp();
+                // Loop over columns. We compute 8 columns per iteration.
+                for ( int k = 0 ; k <  nCols; k += 5 )
+                {
+                    int my_k = k + laneId_div_5;
+                    utils::syncwarp();
+                    // Exchange column indices.
+#if __CUDA_ARCH__ < 300
+                    int waColId = -1;
+                    // int waColId = my_s_aColIds[my_k];
+#else
+                    int waColId = utils::shfl( aColId, my_k, warpSize, active_mask );
+#endif
+                    if ( ! (laneId_div_5 < 5 ) || ! (my_k < nCols ) )
+                        waColId = -1;
+                    utils::syncwarp();                    
+                    // Load 8 blocks of X if needed.
+                    ValueTypeB *my_ptr = Delta;
+
+                    if ( xIsZero )
+                    {
+                        my_ptr = x;
+                    }
+
+                    ValueTypeB my_x(0);
+                    utils::syncwarp();
+                    if ( waColId != -1 )
+                    {
+                        if(laneId_div_5 < 5)
+                            my_x = my_ptr[5 * waColId + laneId_mod_5];
+                    }
+
+                    my_s_mem[laneId] = my_x;
+                    utils::syncwarp();
+                    // Load 8 blocks of A.
+#pragma unroll
+                    for ( int i = 0 ; i < 5 ; ++i )
+                    {
+                        int w_aColTmp = aColBegin + k + i, w_aColIt = -1;
+
+                        if ( w_aColTmp < aColEnd )
+                        {
+                            w_aColIt = w_aColTmp;
+                        }
+
+                        ValueTypeA my_val(0);
+                            utils::syncwarp();
+                        if ( w_aColIt != -1 )
+                        {
+                            if ( laneId_div_5 < 5 )
+                                my_val = nonzero_values[25 * w_aColIt + laneId];
+                        }
+                            utils::syncwarp();
+                        if ( ROW_MAJOR )
+                        {
+                            if ( laneId_div_5 < 5 )
+                                {
+                                    my_bmAx -= my_val * my_s_mem[5 * i + laneId_mod_5];
+                                    //  temp_mul = (1.0 + my_val - my_val) * my_val * my_s_mem[5 * i + laneId_mod_5];
+                                    // my_bmAx = -temp_mul + my_bmAx;
+                                }
+                            utils::syncwarp();
+                        }
+                        else
+                        {
+                            // my_bmAx -= my_val * my_s_mem[4 * i + halfLaneId_div_4];
+                        }
+                    }
+                } // Loop over k
+            } // Loop over aColIt
+
+            // Reduce bmAx terms.
+#if __CUDA_ARCH__ >= 300
+            my_bmAx_2 = my_bmAx;
+            s_mem[threadIdx.x] = my_bmAx_2;
+            if ( ROW_MAJOR )
+            {
+                // __syncwarp();
+
+                // if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+                
+                // __syncwarp();
+
+                // if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+                
+                // __syncwarp();
+
+                // if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+                
+                // __syncwarp();
+
+                __syncwarp();
+
+                if ( laneId < 24 ) { my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+                
+                __syncwarp();
+
+                if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+                __syncwarp();
+
+                if ( laneId < 23 ) { my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+                
+                __syncwarp();
+
+                if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+                __syncwarp();
+
+                if ( laneId < 21 ) { my_bmAx += s_mem[threadIdx.x + 1]; }
+                
+                __syncwarp();
+
+                if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx; }
+                
+                __syncwarp();
+
+
+
+
+            }
+            else
+            {
+                // my_bmAx += utils::shfl_xor( my_bmAx, 4, warpSize, active_mask );
+                // my_bmAx += utils::shfl_xor( my_bmAx, 8, warpSize, active_mask );
+            }
+
+#else
+            // s_mem[threadIdx.x] = my_bmAx;
+
+            // if ( ROW_MAJOR )
+            // {
+            //     if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+
+            //     if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 2]; }
+            // }
+            // else
+            // {
+            //     if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+            //     if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+            // }
+
+#endif
+        } // if current_color != num_colors-1
+
+        // Update the shared terms.
+        // if ( ROW_MAJOR )
+        // {
+        //     if ( laneId_mod_5 == 0 && laneId_div_5 < 5)
+        //     {
+        //         my_s_mem[laneId_div_5] = my_bmAx;
+        //         // if(aRowId == 62114)
+        //         //     printf("%lf %d\n",my_bmAx*1e12,laneId_div_5);
+        //     }
+        // }
+        // else
+        // {
+        //     // if ( halfLaneId_div_4 == 0 )
+        //     // {
+        //     //     my_s_mem[halfLaneId_mod_4] = my_bmAx;
+        //     // }
+        // }
+
+        // // Update the diagonal term.
+        // int w_aColIt = dia_indices[aRowId];
+        // ValueTypeA my_val(0);
+        // utils::syncwarp();
+
+        // if ( w_aColIt != -1 )
+        // {
+        //     if(laneId_div_5 < 5)
+        //        my_val = nonzero_values[25 * w_aColIt + laneId];
+        // }
+        // utils::syncwarp();
+        // if ( ROW_MAJOR )
+        // {
+        //     if(laneId_div_5 < 5)
+        //     {
+        //          my_bmAx = my_val * my_s_mem[laneId_mod_5];
+        //     }   
+            
+        // }
+        // else
+        // {
+        //     // if(laneId_div_5 < 5)
+        //     //     my_bmAx = my_val * my_s_mem[laneId_div_5];
+        // }
+        // utils::syncwarp();
+//         // Regroup results.
+// #if __CUDA_ARCH__ >= 300
+//         my_bmAx_2 = my_bmAx;
+//         s_mem[threadIdx.x] = my_bmAx_2;
+
+//         if ( ROW_MAJOR )
+//         {
+//             // __syncwarp();
+
+//             // if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+            
+//             // __syncwarp();
+
+//             // if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+            
+//             // __syncwarp();
+
+//             // if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+            
+//             // __syncwarp();
+
+//                 __syncwarp();
+
+//                 if ( laneId < 24 ) { my_bmAx_2 += s_mem[threadIdx.x + 1]; }
+                
+//                 __syncwarp();
+
+//                 if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+//                 __syncwarp();
+
+//                 if ( laneId < 23 ) { my_bmAx_2 += s_mem[threadIdx.x + 2]; }
+                
+//                 __syncwarp();
+
+//                 if ( laneId < 23 ) { s_mem[threadIdx.x] = my_bmAx_2; }
+                
+//                 __syncwarp();
+
+//                 if ( laneId < 21 ) { my_bmAx += s_mem[threadIdx.x + 1]; }
+                
+//                 __syncwarp();
+
+//                 if ( laneId < 21 ) { s_mem[threadIdx.x] = my_bmAx; }
+                
+//                 __syncwarp();
+
+//         }
+//         else
+//         {
+//             // my_bmAx += utils::shfl_xor( my_bmAx, 4 );
+//             // my_bmAx += utils::shfl_xor( my_bmAx, 8 );
+//         }
+
+// #else
+//         // s_mem[threadIdx.x] = my_bmAx;
+
+//         // if ( ROW_MAJOR )
+//         // {
+//         //     if ( laneId < 31 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 1]; }
+
+//         //     if ( laneId < 30 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 2]; }
+//         // }
+//         // else
+//         // {
+//         //     if ( laneId < 28 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 4]; }
+
+//         //     if ( laneId < 24 ) { s_mem[threadIdx.x] = my_bmAx += s_mem[threadIdx.x + 8]; }
+//         // }
+
+// #endif
+
+        // Store the results.
+        if ( ROW_MAJOR )
+        {
+            ValueTypeB my_x(0);
+            utils::syncwarp();
+            if ( !xIsZero && laneId_mod_5 == 0 && laneId_div_5 < 5)
+            {
+                my_x = x[5 * aRowId + laneId_div_5];
+            }
+
+            // my_x += weight * my_bmAx;
+
+            
+            if ( !xIsZero && laneId_mod_5 == 0 && laneId_div_5 < 5)
+            {
+                Delta[5 * aRowId + laneId_div_5] = my_bmAx;
+            }
+            utils::syncwarp();
+            if ( laneId_mod_5 == 0 && laneId_div_5 < 5)
+            {
+                x[5 * aRowId + laneId_div_5] = my_bmAx;
+                // if(aRowId == 62114)
+                //     printf("%lf %d\n",my_x*1e12,laneId_div_5);
+            }
+        }
+        else
+        {
+            // ValueTypeB my_x(0);
+
+            // if ( !xIsZero && halfLaneId_div_4 == 0 )
+            // {
+            //     my_x = x[4 * aRowId + halfLaneId_mod_4];
+            // }
+
+            // my_x += weight * my_bmAx;
+
+            // if ( !xIsZero && halfLaneId_div_4 == 0 )
+            // {
+            //     Delta[4 * aRowId + halfLaneId_mod_4] = my_bmAx;
+            // }
+
+            // if ( halfLaneId_div_4 == 0 )
+            // {
+            //     x[4 * aRowId + halfLaneId_mod_4] = my_x;
+            // }
+        }
+    }
+
+}
+#else
+    FatalError("Haven't implemented LU_backward_5x5 for not EXPERIMENTAL_LU", AMGX_ERR_NOT_SUPPORTED_TARGET);
+#endif
+
 
 #ifdef EXPERIMENTAL_LU_BACKWARD
 
@@ -3434,7 +4194,6 @@ compute_LU_factors_5x5_kernel_warp( int A_nRows,
             
         }
 
-
         // Now load all column indices of neighbours that have colors smaller than yours
         for ( int aColIt = aColBeg; aColIt < aColSmaller; aColIt++)
         {
@@ -4321,47 +5080,41 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
         {
             if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
             {
-                if( i == 0 )
-                {
-                    time_t start,stop;
-                    start = time(NULL);
-                    const char* filename1 = "./debugdata/row_ptr.dat";
-                    const char* filename2 = "./debugdata/col_ind.dat";
-                    const char* filename3 = "./debugdata/value.dat";
-                    const char* filename4 = "./debugdata/diag.dat"; 
-                    const char* filename5 = "./debugdata/smaller_color.dat";
-                    const char* filename6 = "./debugdata/larger_color.dat";
-                    const char* filename7 = "./debugdata/sorted_rows.dat";
-                    const char* filename8 = "./debugdata/offset_rows_per_color.dat";
-                    const char* filename9 = "./debugdata/color_X_cols.dat";
-
-                    writeVectorBinary(filename1,this->m_LU.row_offsets);
-                    printf("1\n");
-                    writeVectorBinary(filename2,this->m_LU.col_indices);
-                    printf("2\n");
-                    writeVectorBinary(filename3,this->m_LU.values);
-                    printf("3\n");
-                    writeVectorBinary(filename4,this->m_LU.diag);
-                    printf("4\n");
-                    writeVectorBinary(filename5,this->m_LU.m_smaller_color_offsets);
-                    printf("5\n");
-                    writeVectorBinary(filename6,this->m_LU.m_larger_color_offsets);
-                    printf("6\n");
-                    writeVectorBinary(filename7,this->m_LU.getMatrixColoring().getSortedRowsByColor());
-                    printf("7\n");
-                    writeVectorBinary(filename8,this->m_LU.getMatrixColoring().getOffsetsRowsPerColor());
-                    printf("8\n");
-                    // writeVectorBycolor(filename9,this->m_LU.values,this->m_LU.row_offsets,this->m_LU.getMatrixColoring().getSortedRowsByColor(),color_offset,num_rows_per_color,i,5);
-                    printf("9\n");
-                    stop = time(NULL);
-                    printf("Use time %ld\n",stop - start);
-
-                }
-                // if(i == 1)
+                // if( i == 0 )
                 // {
-                //      printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
-                //     const char* filename1 = "./LU_corelink1.dat";
-                //     PM.print(this->m_LU,filename1);
+                //     time_t start,stop;
+                //     start = time(NULL);
+                //     const char* filename1 = "./debugdata/row_ptr.dat";
+                //     const char* filename2 = "./debugdata/col_ind.dat";
+                //     const char* filename3 = "./debugdata/value.dat";
+                //     const char* filename4 = "./debugdata/diag.dat"; 
+                //     const char* filename5 = "./debugdata/smaller_color.dat";
+                //     const char* filename6 = "./debugdata/larger_color.dat";
+                //     const char* filename7 = "./debugdata/sorted_rows.dat";
+                //     const char* filename8 = "./debugdata/offset_rows_per_color.dat";
+                //     const char* filename9 = "./debugdata/color_X_cols.dat";
+
+                //     writeVectorBinary(filename1,this->m_LU.row_offsets);
+                //     printf("1\n");
+                //     writeVectorBinary(filename2,this->m_LU.col_indices);
+                //     printf("2\n");
+                //     writeVectorBinary(filename3,this->m_LU.values);
+                //     printf("3\n");
+                //     writeVectorBinary(filename4,this->m_LU.diag);
+                //     printf("4\n");
+                //     writeVectorBinary(filename5,this->m_LU.m_smaller_color_offsets);
+                //     printf("5\n");
+                //     writeVectorBinary(filename6,this->m_LU.m_larger_color_offsets);
+                //     printf("6\n");
+                //     writeVectorBinary(filename7,this->m_LU.getMatrixColoring().getSortedRowsByColor());
+                //     printf("7\n");
+                //     writeVectorBinary(filename8,this->m_LU.getMatrixColoring().getOffsetsRowsPerColor());
+                //     printf("8\n");
+                //     // writeVectorBycolor(filename9,this->m_LU.values,this->m_LU.row_offsets,this->m_LU.getMatrixColoring().getSortedRowsByColor(),color_offset,num_rows_per_color,i,5);
+                //     printf("9\n");
+                //     stop = time(NULL);
+                //     printf("Use time %ld\n",stop - start);
+
                 // }
 
 
@@ -4379,23 +5132,14 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
                     this->m_LU.get_block_dimx(),
                     thrust::raw_pointer_cast( &returnValue[0] ) );
  
-                    if(i == num_colors - 1 ){
-                        printf("color all: %d color %dth has %d rows\n",num_colors,i,num_rows_per_color);
-                         const char* filename = "./LU_corelink.dat";
-                    //      const char* filename_2 = "./debugdata/LU_corelink_color0.dat";
-                        //  printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PMs;
-                        //  PMs.print(this->m_LU,filename);
-                        //  writeVectorBinary(filename,this->m_LU.values);
-                        writeVectorBycolor(filename,this->m_LU.values,this->m_LU.row_offsets,this->m_LU.getMatrixColoring().getSortedRowsByColor(),color_offset,num_rows_per_color,i,5);
-                        FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
-                    }
-                    // printf("color %dth has %d rows\n",i,num_rows_per_color);
-                    // if(i == num_colors-1){
-                    //         for(int k = 0; k > -1; k++){
-
-                    //         }
-                    // }
-
+                // if(i == num_colors - 1 ){
+                //     printf("color all: %d color %dth has %d rows\n",num_colors,i,num_rows_per_color);
+                //     const char* filename = "./debugdata/value_complete.dat";
+                //     writeVectorBinary(filename,this->m_LU.values);
+                //     // writeVectorBycolor(filename,this->m_LU.values,this->m_LU.row_offsets,this->m_LU.getMatrixColoring().getSortedRowsByColor(),color_offset,num_rows_per_color,i,5);
+                //     FatalError("Unsupported 5x5 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                // }
+                    
             }
             else
             {
@@ -4519,7 +5263,7 @@ MulticolorILUSolver_Base<T_Config>::pre_setup()
     {
         FatalError("Matrix must be colored with coloring_level > sparsity_level for the multicolorILUsolver", AMGX_ERR_CONFIGURATION);
     }
-
+    printf("~~~~~~~~~~~~~~~~~~get color level %d m_sparsity_level %d color %d~~~~~~~~~~~~~~~~~~~~~~~\n",this->m_explicit_A->getColoringLevel(),m_sparsity_level,this->m_explicit_A->getMatrixColoring().getNumColors());
     // Compute extended sparsity pattern based on coloring and matrix A
     computeLUSparsityPattern();
 
@@ -4614,9 +5358,16 @@ MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, boo
     {
         smooth_4x4(b, x, xIsZero);
     }
+    else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 5 && this->m_LU.get_block_dimy() == 5) )
+    {
+        // smooth_5x5(b, x, xIsZero);
+        smooth_bxb(b, x, xIsZero);
+        // printf("smooth_5x5 over\n");
+    }
     else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 3 && this->m_LU.get_block_dimy() == 3) )
     {
-        smooth_3x3(b, x, xIsZero);
+        // smooth_3x3(b, x, xIsZero);
+        smooth_bxb(b, x, xIsZero);
     }
     else
     {
@@ -5036,7 +5787,7 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
         }
         else
         {
-            FatalError("Haven't implemented compute  LU_backward_3x3 for Col Major", AMGX_ERR_NOT_SUPPORTED_TARGET);
+            FatalError("Haven't implemented compute LU_backward_3x3 for Col Major", AMGX_ERR_NOT_SUPPORTED_TARGET);
         }
 
 #else
@@ -5045,6 +5796,181 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     }
     cudaCheckError();
 }
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_5x5(const VVector &b, VVector &x, bool xIsZero)
+{
+    FatalError("Haven't implemented Multicolor DILU smoother for host format", AMGX_ERR_NOT_SUPPORTED_TARGET);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_5x5(const VVector &b, VVector &x, bool xIsZero)
+{
+    Matrix<TConfig_d> &m_LU = this->m_LU;
+    Matrix<TConfig_d> &m_A = *this->m_explicit_A;
+    int N = m_LU.get_num_rows() * m_LU.get_block_dimy();
+    cudaCheckError();
+
+    if (!m_LU.getColsReorderedByColor())
+    {
+        FatalError("ILU solver currently only works if columns are reordered by color. Try setting reordering_cols_by_color=1 in the multicolor_ilu solver scope in the configuration file", AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    // ---------------------------------------------------------
+    // Solving Lower triangular system, with identity diagonal
+    // ---------------------------------------------------------
+    const IndexType *LU_sorted_rows_by_color_ptr = m_LU.getMatrixColoring().getSortedRowsByColor().raw();
+    int num_colors = this->m_LU.getMatrixColoring().getNumColors();
+
+    for (int i = 0; i < num_colors; i++)
+    {
+        const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
+        const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
+#ifdef EXPERIMENTAL_LU_FORWARD
+        const int CtaSize = 128; // Number of threads per CTA
+        const int nWarps = CtaSize / 32;
+        int GridSize = std::min( 2048, ( num_rows_per_color + nWarps - 1 ) / nWarps );
+
+        if ( GridSize == 0 )
+        {
+            continue;    // if perfect coloring (color 0 has no vertices)
+        }
+
+        if ( this->m_explicit_A->getBlockFormat() == ROW_MAJOR )
+        {
+            if (m_A.hasProps(DIAG))
+            {
+               FatalError("Haven't implemented compute LU_forward_3x3 for matrix has diag props", AMGX_ERR_NOT_SUPPORTED_TARGET);
+            }
+            else
+            {
+                if( i == 0 )
+                {
+                    const char* filename1 = "./debugdata/x.dat";
+                    const char* filename2 = "./debugdata/b.dat";
+                    const char* filename3 = "./debugdata/delta.dat";
+
+                    writeVectorBinary(filename1,x);
+                    writeVectorBinary(filename2,b);
+                    writeVectorBinary(filename3,this->m_delta);
+                }
+
+
+                LU_forward_5x5_kernel_warp<IndexType, ValueTypeA, ValueTypeB, CtaSize, 4, true, false> <<< GridSize, CtaSize>>>(
+                    m_LU.row_offsets.raw(),
+                    m_LU.m_smaller_color_offsets.raw(),
+                    m_LU.col_indices.raw(),
+                    m_LU.values.raw(),
+                    m_A.row_offsets.raw(),
+                    m_A.col_indices.raw(),
+                    m_A.values.raw(),
+                    m_A.diag.raw(),
+                    x.raw(),
+                    b.raw(),
+                    this->m_delta.raw(),
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    i,
+                    xIsZero );
+                
+                // if(i == num_colors - 1)
+                // {
+                //     const char* filename4 = "./debugdata/delta_gpu_5.dat";
+                //     writeVectorBinary(filename4,this->m_delta);              
+                //     return ;
+                //     // FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+                // }
+            }
+        }
+        else
+        {
+            FatalError("Haven't implemented compute LU_backward_5x5 for Col Major", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+
+#else
+        {
+           FatalError("Haven't implemented compute  LU_forward_5x5 for Col Major for Not EXPERIMENTAL_LU_BACKWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+#endif
+        cudaCheckError();
+    }
+
+    // --------------------
+    // Backward Sweep
+    // --------------------
+    for (int i = num_colors - 1; i >= 0; i--)
+    {
+        const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
+        const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
+#ifdef EXPERIMENTAL_LU_BACKWARD
+        const int CtaSize = 128; // Number of threads per CTA
+        const int nWarps = CtaSize / 32;
+        int GridSize = std::min( 2048, ( num_rows_per_color + nWarps - 1 ) / nWarps );
+
+        if ( GridSize == 0 )
+        {
+            continue;    // if perfect coloring (color 0 has no vertices)
+        }
+
+        if (this->m_explicit_A->getBlockFormat() == ROW_MAJOR)
+        {
+                if( i == num_colors - 1 )
+                {
+                    const char* filename3 = "./debugdata/Delta.dat";
+
+                    writeVectorBinary(filename3,this->m_Delta);
+                    // ValueTypeB m_weight
+                    const char* filename = "./debugdata/weight.dat";
+                    writeBinary(filename,this->m_weight);
+
+                }
+
+            LU_backward_5x5_kernel_warp<IndexType, ValueTypeA, ValueTypeB, CtaSize, true> <<< GridSize, CtaSize>>>(
+                m_LU.row_offsets.raw(),
+                m_LU.m_larger_color_offsets.raw(),
+                m_LU.col_indices.raw(),
+                m_LU.diag.raw(),
+                m_LU.values.raw(),
+                this->m_delta.raw(),
+                this->m_Delta.raw(),
+                x.raw(),
+                LU_sorted_rows_by_color_ptr + color_offset,
+                num_rows_per_color,
+                i,
+                num_colors,
+                this->m_weight,
+                xIsZero);
+                        
+            printf("backward %d has processed\n",i);
+
+            // if (i == num_colors -1  )
+            if (i == 0 )
+            {
+                const char* filename = "./debugdata/x_gpu_5.dat";
+                writeVectorBinary(filename,this->m_Delta);
+                return;
+                // FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+
+            }
+
+        }
+        else
+        {
+           FatalError("Haven't implemented compute LU_backward_5x5 for Col Major or Not EXPERIMENTAL_LU_BACKWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+        }
+
+#else
+       {
+           FatalError("Haven't implemented compute LU_backward_5x5 for Col Major or Not EXPERIMENTAL_LU_BACKWARD", AMGX_ERR_NOT_SUPPORTED_TARGET);
+       }
+#endif
+    }
+
+    cudaCheckError();
+}
+
+
+
 
 template<int CtaSize, int SMemSize, bool ROW_MAJOR, typename ValueTypeA >
 __global__
@@ -5063,13 +5989,12 @@ void axpy_color(const ValueTypeA *x,
     // __shared__ volatile ValueTypeA s_x[SMemSize];
     // __shared__ volatile ValueTypeA s_y[SMemSize];
 
-    int globalThreadId = blockIdx.x * blockDim.x + threadIdx.x;
-    int RowId = globalThreadId / blockDimx;
-    int VarId = globalThreadId % blockDimx;
-    int aRowId = sorted_rows_by_color[RowId];
 
-
-    if(RowId < num_rows_per_color){
+    for(int threadId =  blockIdx.x * blockDim.x + threadIdx.x; threadId < num_rows_per_color * blockDimx; threadId += gridDim.x * blockDim.x)
+    {
+        int RowIt = threadId / blockDimx;
+        int VarId = threadId % blockDimx;
+        int aRowId = sorted_rows_by_color[RowIt];
         y[aRowId * blockDimx + VarId] += alpha * x[aRowId * blockDimx + VarId];
     }
 
@@ -5114,8 +6039,22 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     cudaCheckError();
     bool skipped_end = false;
 
+
+
+
     for (int i = 0; i < num_colors; i++)
     {
+        // if( i == 0 )
+        // {
+        //     const char* filename1 = "./debugdata/x.dat";
+        //     const char* filename2 = "./debugdata/b.dat";
+        //     const char* filename3 = "./debugdata/delta.dat";
+
+        //     writeVectorBinary(filename1,x);
+        //     writeVectorBinary(filename2,b);
+        //     writeVectorBinary(filename3,this->m_delta);
+        // }
+
         const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
         const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
 
@@ -5126,17 +6065,19 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
             // delta = delta - LU*delta smaller colors
             Cusparse::bsrmv(Cusparse::SMALLER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_delta, (ValueTypeA)1.0f, this->m_delta);
         }
-
+        cudaCheckError();
         if (num_rows_per_color > 0)
         {
             skipped_end = true;
         }
+
+        // if(i == num_colors - 1)
+        // {
+        //     const char* filename4 = "./debugdata/delta_gpu_b.dat";
+        //     writeVectorBinary(filename4,this->m_delta);              
+        //     // FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+        // }
     }
-
-
-        // const char* filename = "LU_forward.dat";
-        // printMatrix< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > PM;
-        // PM.print(this->m_LU,filename);
            
 
     cudaCheckError();
@@ -5145,52 +6086,81 @@ void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     // --------------------
     // Backward Sweep
     // --------------------
-    const int CtaSize = 128; // Number of threads per CTA
-    const int SMemSize = 128;
+    const int CtaSize = 160; // Number of threads per CTA
+    const int SMemSize = 160;
     const int nRows = CtaSize / m_LU.get_block_dimx();
-    for (int i = num_colors - 1; i >= 0; i--)
+    for (int i = num_colors - 1; i >=  0; i--)
     {
+        // if( i == num_colors - 1 )
+        // {
+        //     const char* filename4 = "./debugdata/Delta.dat";
+
+        //     writeVectorBinary(filename4,this->m_Delta);
+        //     // ValueTypeB m_weight
+        //     const char* filename5 = "./debugdata/weight.dat";
+        //     writeBinary(filename5,this->m_weight);
+
+        // }
         const IndexType color_offset = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i];
         const IndexType num_rows_per_color = m_LU.getMatrixColoring().getOffsetsRowsPerColor()[i + 1] - color_offset;
         int GridSize = std::min( 2048, ( num_rows_per_color + nRows - 1 ) / nRows );
 
-        if ( GridSize == 0 )
-        {
-            continue;    // if perfect coloring (color 0 has no vertices)
-        }
+        if ( num_rows_per_color == 0 )  { continue;  }  // if perfect coloring (color 0 has no vertices)
 
         // delta = delta - LU*Delta larger colors
         if(skipped_end){
             if ( xIsZero ){
-                //Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, x, (ValueTypeA)1.0f, this->m_delta);
-                Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
+                Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, x, (ValueTypeA)1.0f, this->m_delta);
+                // Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
             }
             else{
                 Cusparse::bsrmv(Cusparse::LARGER_COLORS, i, (ValueTypeA) - 1.0f, m_LU, this->m_Delta, (ValueTypeA)1.0f, this->m_delta);
             }
         }
-        // Multiple by inverse stored on diagonal
+        cudaCheckError();    
+        // Multiple by inverse stored on diagonal  Delta = delta * LU diagonal
         Cusparse::bsrmv(Cusparse::DIAG_COL, i, (ValueTypeA) 1.0f, m_LU, this->m_delta, 0.0f, this->m_Delta);
-        
+        cudaCheckError();   
+
         axpy_color<CtaSize, SMemSize, true> <<< GridSize, CtaSize>>>(
-            this->m_Delta.raw(),
-            x.raw(),
-            (double)this->m_weight,
-            LU_sorted_rows_by_color_ptr + color_offset,
-            num_rows_per_color,
-            m_LU.get_block_dimx());
+                    this->m_Delta.raw(),
+                    x.raw(),
+                    (double)this->m_weight,
+                    LU_sorted_rows_by_color_ptr + color_offset,
+                    num_rows_per_color,
+                    m_LU.get_block_dimx());
+        
+        
 
         if (num_rows_per_color > 0)
         {
             skipped_end = true;
         }
-    }
+        // printf("xIszero: %d\n",xIsZero);
+        
+        // if (i == 0)
+        // {
+        //     // const char* filename6 = "./debugdata/delta_gpu_b.dat";
+        //     // writeVectorBinary(filename6,this->m_delta);
+        //     const char* filename7 = "./debugdata/Delta_gpu_b.dat";
+        //     writeVectorBinary(filename7,this->m_Delta);
 
-        //     const char* filename2 = "LU_backward.dat";
-        // PM.print(this->m_LU,filename2);
-        // FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
- 
-    cudaCheckError();
+        //     FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+        // }
+
+    }
+    cudaCheckError();    
+    //x = x + weight * Delta
+    // axpy(this->m_Delta,x,this->m_weight,0,-1);
+    // cudaCheckError();
+    //     //     // if (i == 0 )
+//     {
+//         const char* filename6 = "./debugdata/x_gpu_b.dat";
+//         writeVectorBinary(filename6,x);
+
+//         FatalError("Unsupported 3x3 COL_MAJOR block for Multicolor ILU solver, computeLUFactors", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+
+//     }
 }
 
 
