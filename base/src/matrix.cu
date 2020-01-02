@@ -1180,7 +1180,10 @@ void reorderElementsDeviceCSR(INDEX_TYPE num_rows,
                               INDEX_TYPE block_size)
 {
     thrust::device_ptr<INDEX_TYPE> dev_ptr = thrust::device_pointer_cast(row_offsets);
-    INDEX_TYPE max_row_length = std::max(1, thrust::transform_reduce(dev_ptr, dev_ptr + num_rows, row_length<INDEX_TYPE>(), 0, thrust::maximum<INDEX_TYPE>()));
+    thrust::device_vector<INDEX_TYPE> tmp_vec (dev_ptr, dev_ptr + num_rows);
+    thrust::transform(dev_ptr + 1, dev_ptr + 1 + num_rows, tmp_vec.begin(), tmp_vec.begin(), thrust::minus<INDEX_TYPE>() );
+    INDEX_TYPE max_row_length = thrust::reduce(tmp_vec.begin(), tmp_vec.end(), 0, thrust::maximum<INDEX_TYPE>());;
+    // INDEX_TYPE max_row_length = std::max(1, thrust::transform_reduce(dev_ptr, dev_ptr + num_rows, row_length<INDEX_TYPE>(), 0, thrust::maximum<INDEX_TYPE>()));
     //TODO: optimise this in terms of storage
     INDEX_TYPE storage_space = 100 * 1024 * 1024 * sizeof(T) / sizeof(cuDoubleComplex); // because we allocate as for cuComplex
     INDEX_TYPE blocks = 1500 < storage_space / (max_row_length * block_size * sizeof(T)) ? 1500 : storage_space / (max_row_length * block_size * sizeof(T));
