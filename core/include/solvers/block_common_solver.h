@@ -30,7 +30,6 @@
 #include "amgx_types/util.h"
 #include "amgx_types/math.h"
 
-
 namespace amgx
 {
 
@@ -466,25 +465,26 @@ void compute_block_inverse_row_major5x5_formula2( volatile ValueType *s_Amat, co
 
     ValueType my_A = s_A(j_ind, i_ind);
 
+    __syncwarp(__activemask());
     // Each thread stores its result in shared memory to compute determinant
     s_A(i_ind, j_ind) = my_A * cofactor;
-
+    __syncwarp(__activemask());
     // Each thread computes det
     ValueType det = s_A(0, 0) + s_A(0, 1) + s_A(0, 2) + s_A(0, 3) + s_A(0, 4);
 
     if (store_result)
     {
-        if (isNotCloseToZero(det) )
-        {
-            Einv[e_offset] = cofactor / det;
-        }
-        else
-        {
-            Einv[e_offset] = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
-        }
+        // if (isNotCloseToZero(det) )
+        // {
+        //     Einv[e_offset] = cofactor / det;
+        // }
+        // else
+        // {
+        //     Einv[e_offset] = (i_ind == j_ind) ? ( isNotCloseToZero(my_A) ? ValueType(1) / my_A : ValueType(1) / epsilon(my_A)) : ValueType(0.);
+        // }
 
 
-        //Einv[e_offset] = cofactor/epsilon(det);
+        Einv[e_offset] = cofactor/det;
     }
     else
     {
