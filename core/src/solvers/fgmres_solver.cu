@@ -31,7 +31,7 @@
 #include <util.h>
 #include <cutil.h>
 #include <norm.h>
-
+#include <memory_info.h>
 //TODO remove synchronization from this module by moving host operations to the device
 
 namespace amgx
@@ -436,6 +436,7 @@ FGMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
     A.getOffsetAndSizeForView(A.getViewExterior(), &offset, &size);
     bool done = false;
     int m = this->m_curr_iter % m_R; //current iteration within restart
+    MemoryInfo::updateMaxMemoryUsage();
 
     if (m == 0)
     {
