@@ -452,22 +452,22 @@ int main(int argc, const char **argv)
     // // printf("value read\n");
 
     FILE *fp_row_ptr;
-    if((fp_row_ptr = fopen("./bin/row_ptr.dat","rb")) == NULL){
+    if((fp_row_ptr = fopen("./row_ptr.dat","rb")) == NULL){
                 printf("cannot open the file row_ptr.dat");
         }
     
     FILE *fp_col_ind;
-    if((fp_col_ind = fopen("./bin/col_ind.dat","rb")) == NULL){
+    if((fp_col_ind = fopen("./col_ind.dat","rb")) == NULL){
                 printf("cannot open the file col_ind.dat");
         }
     
     FILE *fp_value;
-    if((fp_value = fopen("./bin/value.dat","rb")) == NULL){
+    if((fp_value = fopen("./value.dat","rb")) == NULL){
                 printf("cannot open the file value.dat");
         }
 
     FILE *fp_RHS;
-    if((fp_RHS = fopen("./bin/b.dat","rb")) == NULL){
+    if((fp_RHS = fopen("./b.dat","rb")) == NULL){
                 printf("cannot open the file value.dat");
         }
 
