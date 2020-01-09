@@ -148,6 +148,7 @@ int main(int argc, char **argv)
     MPI_Init(&argc, &argv);
     MPI_Comm_size(amgx_mpi_comm, &nranks);
     MPI_Comm_rank(amgx_mpi_comm, &rank);
+    printf("rank %d of %d ranks\n",rank,nranks);
     //CUDA GPUs
     CUDA_SAFE_CALL(cudaGetDeviceCount(&gpu_count));
     lrank = rank % gpu_count;
@@ -274,7 +275,7 @@ int main(int argc, char **argv)
     //WARNING: use 1 ring for aggregation and 2 rings for classical path
     int nrings; //=1; //=2;
     AMGX_config_get_default_number_of_rings(cfg, &nrings);
-    //printf("nrings=%d\n",nrings);
+    //printf("nrings=%d\n",nrings); nrings = 1
     int nglobal = 0;
 
     if  ((pidx = findParamIndex(argv, argc, "-p")) != -1)
@@ -306,8 +307,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < n; i ++)
     {
         row_ptrs[i] = nnz;
+        printf("rank %d %d of %d and nnz %d   \n",rank,i,n,nnz);
 
-        if (rank > 0 || i > ny)
+        if (rank > 0 || i > (ny-1))
         {
             col_indices[nnz] = (i + start_idx - ny);
 
@@ -320,7 +322,9 @@ int main(int argc, char **argv)
                 ((double *)values)[nnz] = -1.;
             }
 
+            printf("1 2col_indices[%d]: %ld values[%d]: %lf  i:%d \n",nnz,col_indices[nnz],nnz, ((double *)values)[nnz],i);
             nnz++;
+            
         }
 
         if (i % ny != 0)
@@ -335,7 +339,7 @@ int main(int argc, char **argv)
             {
                 ((double *)values)[nnz] = -1.;
             }
-
+            printf("2 col_indices[%d]: %ld values[%d]: %lf  i:%d \n",nnz,col_indices[nnz],nnz, ((double *)values)[nnz],i);
             nnz++;
         }
 
@@ -350,11 +354,11 @@ int main(int argc, char **argv)
             {
                 ((double *)values)[nnz] = 4.;
             }
-
+            printf("3 col_indices[%d]: %ld values[%d]: %lf  i:%d \n",nnz,col_indices[nnz],nnz, ((double *)values)[nnz],i);
             nnz++;
         }
 
-        if ((i + 1) % ny == 0)
+        if ((i + 1) % ny )
         {
             col_indices[nnz] = (i + start_idx + 1);
 
@@ -366,7 +370,7 @@ int main(int argc, char **argv)
             {
                 ((double *)values)[nnz] = -1.;
             }
-
+            printf("4 col_indices[%d]: %ld values[%d]: %lf  i:%d \n",nnz,col_indices[nnz],nnz, ((double *)values)[nnz],i);
             nnz++;
         }
 
@@ -382,9 +386,11 @@ int main(int argc, char **argv)
             {
                 ((double *)values)[nnz] = -1.;
             }
-
+            printf("5 col_indices[%d]: %ld values[%d]: %lf i:%d \n",nnz,col_indices[nnz],nnz, ((double *)values)[nnz],i);
             nnz++;
         }
+        printf("\n");
+        // printf("rank %d row_ptrs[%d]: %d col_indices[%d]: %ld values[%d]: %lf\n",rank,nnz-1,row_ptrs[nnz-1],nnz-1,col_indices[nnz-1],nnz-1, ((double *)values)[nnz-1]);
     }
 
     row_ptrs[n] = nnz;
