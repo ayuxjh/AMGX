@@ -5348,7 +5348,13 @@ MulticolorILUSolver_Base<T_Config>::solver_setup(bool reuse_matrix_structure)
     // Fill LU sparsity pattern
     fillLUValuesWithAValues();
     // Compute LU factors in place (update LU.values)
+    clock_t start_computeLUFactors,end_computeLUFactors;
+    double elapsed_computeLUFactors = 0.0;
+    start_computeLUFactors = clock();
     computeLUFactors();
+    end_computeLUFactors = clock();
+    elapsed_computeLUFactors = (double) (end_computeLUFactors - start_computeLUFactors)/CLOCKS_PER_SEC;
+     cout << "computeLUFactors Time:" << elapsed_computeLUFactors << endl;
 }
 
 //
@@ -5368,12 +5374,21 @@ MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, boo
     }
     else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 5 && this->m_LU.get_block_dimy() == 5) )
     {
+        clock_t start_Smoother,end_Smoother;
+        static double elapsed_Smoother = 0.0;
+        start_Smoother = clock();
         // smooth_5x5(b, x, xIsZero);
         smooth_bxb(b, x, xIsZero);
         // printf("smooth_5x5 over\n");
+        
+        end_Smoother = clock();
+        elapsed_Smoother += (double) (end_Smoother - start_Smoother)/CLOCKS_PER_SEC;
+        cout << "Smoother Time:" << elapsed_Smoother << endl;
+
     }
     else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 3 && this->m_LU.get_block_dimy() == 3) )
     {
+        
         // smooth_3x3(b, x, xIsZero);
         smooth_bxb(b, x, xIsZero);
     }
