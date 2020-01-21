@@ -5271,7 +5271,7 @@ MulticolorILUSolver_Base<T_Config>::pre_setup()
     {
         FatalError("Matrix must be colored with coloring_level > sparsity_level for the multicolorILUsolver", AMGX_ERR_CONFIGURATION);
     }
-    printf("~~~~~~~~~~~~~~~~~~get color level %d m_sparsity_level %d color %d~~~~~~~~~~~~~~~~~~~~~~~\n",this->m_explicit_A->getColoringLevel(),m_sparsity_level,this->m_explicit_A->getMatrixColoring().getNumColors());
+    // printf("get color level %d m_sparsity_level %d color %d~~~~~~~~~~~~~~~~~~~~~~~\n",this->m_explicit_A->getColoringLevel(),m_sparsity_level,this->m_explicit_A->getMatrixColoring().getNumColors());
     // Compute extended sparsity pattern based on coloring and matrix A
     computeLUSparsityPattern();
 
