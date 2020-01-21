@@ -4285,13 +4285,13 @@ extern "C" {
         resources->getResourcesConfig()->getParameter<std::string>("preconditioner", precond_value, solver_scope, precond_scope);
         algorithm_p = resources->getResourcesConfig()->getParameter<AlgorithmType>("algorithm", precond_scope);
 
-        if (algorithm_s == CLASSICAL && algorithm_p == CLASSICAL)
-        {
-            std::stringstream msg;
-            msg << "CLASSICAL is not supported in AMGX_read_system_maps_one_ring.\n";
-            amgx_distributed_output(msg.str().c_str(), msg.str().length());
-            AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_PARAMETERS, resources)
-        }
+        // if (algorithm_s == CLASSICAL && algorithm_p == CLASSICAL)
+        // {
+        //     std::stringstream msg;
+        //     msg << "CLASSICAL is not supported in AMGX_read_system_maps_one_ring.\n";
+        //     amgx_distributed_output(msg.str().c_str(), msg.str().length());
+        //     AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_PARAMETERS, resources)
+        // }
 
         AMGX_RC rc0;
 
