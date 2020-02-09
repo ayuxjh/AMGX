@@ -5379,7 +5379,23 @@ MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, boo
 {
     if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 4 && this->m_LU.get_block_dimy() == 4) )
     {
+        cudaEvent_t start,stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start,0);
+        // smooth_5x5(b, x, xIsZero);
         smooth_4x4(b, x, xIsZero);
+        cudaEventRecord(stop,0);
+        cudaEventSynchronize(stop);
+        float elapsedTime;
+        static float time = 0.f;
+        cudaEventElapsedTime(&elapsedTime,start,stop);
+        // printf("smooth_5x5 over\n");
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        time += elapsedTime;
+        cout << "Smoother used " << time/1000 << endl;
+        
     }
     else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 5 && this->m_LU.get_block_dimy() == 5) )
     {
