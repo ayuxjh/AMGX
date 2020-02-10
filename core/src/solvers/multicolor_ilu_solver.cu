@@ -5394,7 +5394,7 @@ MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, boo
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
         time += elapsedTime;
-        cout << "Smoother used " << time/1000 << endl;
+        cout << "Smoother used: " << time/1000 << endl;
         
     }
     else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 5 && this->m_LU.get_block_dimy() == 5) )
